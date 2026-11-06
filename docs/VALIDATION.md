@@ -2,6 +2,32 @@
 
 This is an executable single-server MVP. Validation results below are from the local development machine on 23–24 September 2026; they are not a production SLA.
 
+## Confirmed-build omission evidence
+
+A confirmed build may prune invalid pipelines, object types, relationships, and actions before revalidating. `proposal.data.validation.checks` and `valid` describe the surviving bundle, not the completeness of the original suggestion. When definitions were pruned, `proposal.data.validation.omissions` retains their kind, name, and redacted failure reasons; dependency removals explicitly name the omitted object type. This evidence survives publication cleanup of build checkpoints. It does not reconstruct rejection reasons for older publications that discarded them, and it does not establish empirical relationship coverage or business meaning. Dashboard widget failures remain explained in bundle assumptions.
+
+New confirmed builds explicitly store an empty `omissions` array when validation removed no definitions; an absent field means that pruning history is unavailable, not that nothing was omitted. The Ontology page displays the active publication's validation status and retained reasons in a collapsed, keyboard-accessible disclosure. It labels missing history without deriving rejection reasons from current suggestions, and never treats passing checks as proof of completeness.
+
+Exact duplicate source-column relationship mappings are collapsed during catalog-backed discovery and again when planning saved suggestions. Identity preserves direction, endpoint entity roles, physical datasets/columns, and comparison mode; display labels and asserted match counts are not identity. The first mapping and its evidence are retained without merging or upgrading counts. Saved-suggestion collapses are named in bundle assumptions. Imported catalogs and existing publications are not rewritten.
+
+### Relationship count provenance
+
+`SuggestedLink.matchBasis` and relationship validation previews distinguish `measured`, `asserted`, and `unverified` counts. Statistical overlap produces measured counts; catalog-only links carry assertions. The separate `evidence` category describes why a link was proposed: `declared` is not proof that its coverage was measured or that SAP enforces it as a foreign key. Legacy records without count provenance remain unverified.
+
+Saved-evidence validation checks schemas without rescanning data and explicitly says when counts were not remeasured; direct join queries mark their own previews as measured. Historical numeric fields remain for compatibility, so consumers must check provenance rather than interpret any saved 100% as an observation. The ontology UI shows numeric coverage only for measured counts, and will not inherit coverage from a different member/source mapping. A measured marker is not a business-semantic endorsement, full key audit, or freshness guarantee. No existing publications are rewritten by this metadata/UI change.
+
+### Mounted-source freshness
+
+Schema/evidence validation checks mounted Parquet paths against the active version's saved size/mtime fingerprint, even when no SQL query runs. Checks reuse the connector's canonical mount-boundary resolver, require matching dataset/version ownership and valid fingerprints, and are cached only within a single validation pass. Active version metadata takes precedence over dataset cache fields that may describe a pending import.
+
+Publication repeats these checks before staging writes and again before generation activation (including transaction retries). A file can change without its dataset's `activeVersion` changing; a matching version ID alone is not sufficient. Stale, missing, escaped, or unverifiable mounted sources block publication rather than triggering an automatic refresh. These checks use metadata only: they do not read Parquet columns, reprofile, regenerate files, or create a frozen source snapshot. Size/mtime cannot detect a same-size replacement with preserved timestamps, and an external writer can still change a file after the final stat. If a change is caught after metadata chunks were staged, the old generation remains active; inactive assets and already-staged catalog metadata may remain for a retry. The freshness guard does not roll back those earlier metadata writes.
+
+### Catalog key resolution
+
+When no profile-selected key exists, discovery tries declared single-column alternatives against actual physical column names. Literal case-insensitive names take precedence; normalized, localized suffix and label-qualified matches must be unique at their matching tier. Ambiguous headers are not resolved by order, including for curated relationships. Advisory catalog checks apply the same rules within each extract variant instead of treating aliases from separate extracts as one ambiguous schema.
+
+Resolving a physical spelling does not establish uniqueness. Catalog-only fallback keys carry explicit review notes; unresolved declarations remain review candidates rather than synthesized source columns. Existing per-dataset profile-selected keys take precedence over these fallback declarations. Composite declarations resolve per extract variant to physical components (first fully-resolving declaration wins); the components stay advisory until a materialized build promotes them through a measured separator-joined surrogate, with joint uniqueness, non-nullness and blank-freedom re-asserted by pipeline checks at validation time. Schema-only and over-budget plans refuse composites with recorded assumption reasons instead. Composite expressions are never quoted as columns. Promotion does not automatically restore historically omitted entities; those need the rebuild runbook.
+
 ## Verified paths
 
 - Native HelixDB v0.0.6 persistence, indexed workspace identities, conditional atomic metadata writes, stale-write rejection, native object relationships, and relationship deletion.
@@ -175,3 +201,68 @@ No synthetic regen: the owner's machine cannot take a 25-minute 60 GB generation
 | mobi/ZTX_VIAPASS_DTS | 79.4M | 0.4s | 0.7s |
 
 Multi-file: the ANPR pair shares 13 of 15 columns, so a `UNION ALL` over the shared schema (18.76M rows / 2.9 GB) is a genuine cross-file streaming query — exact count in 1.7s. Concurrency (`EXECUTOR_CONCURRENCY=2`): 63M- and 79M-row full group-bys in parallel — both 200, 1.9s wall, no queue penalty. Executor cgroup peak across the whole series: **84 MiB**; ~33 GB cumulatively scanned. The widest real file (DFKKOP, 162 columns) aggregates exactly, so the 2 GB DuckDB budget holds with headroom. Honest scope: lake schemas are heterogeneous, so no single 60 GB query exists to run — certification here means linear scaling, flat memory, and exact counts, and all three hold. What remains unmeasured: a single 60 GB import and high partition cardinality (see above).
+
+### Approval integrity and source binding
+
+Compact ontology confirmations retain the approved suggestion identity, edits and
+exact approved-value digest. Revision requests and the confirmation status both
+verify reconstruction against that digest; text-only updates, replacement
+suggestions, missing suggestions and altered edits require renewed confirmation.
+Legacy full-value approvals are verified as well. No additional full ontology copy
+is persisted in workspace metadata.
+
+Validation preserves explicitly bound source IDs by default, including when a
+second selected dataset has a better-fitting schema. Only unconfirmed AI build
+planning opts into schema-based source correction (`allowDatasetRebinding`), before
+human review. Confirmed builds, manual edits and publication validation do not.
+
+### Schema-only review and rollback
+
+Server-generated proposals and publications retain `publicationMode` (`records`
+or `schema-only`). Edits, revalidation and rollback inherit that mode from the
+stored parent, never from request metadata. Schema-only publishing never stages
+source-member edges as anchor object identities.
+
+Saved relationship evidence is reconstructed from the server-owned validation
+report, only when its proposal hash, full relationship/type definitions and all
+recorded input versions still match. Mounted-source fingerprints are also checked
+by validation and before activation. Summary-only edits can retain compatible
+evidence; changed relationship/type definitions, missing evidence or changed versions require a
+new trusted build. They do not trigger automatic relationship scans at scale.
+Measured, asserted and unverified provenance remain distinct.
+
+Legacy raw-member proposals can recover schema-only mode when their valid saved
+report contains compatible trusted evidence. Legacy anchor-only proposals without
+a mode marker cannot reliably reveal whether records were staged; review/rollback
+fails closed with a rebuild message rather than guessing and scanning large tables. New schema-only publications persist the marker even
+when they contain no member links. This is not an implementation of member-to-anchor
+identity mapping or certification of link semantics.
+
+Post-publication revisions retain `parentId` for lineage, but do not inherit the
+completed setup run's publication guard. They use ordinary human review and the
+current version/generation/permission checks. Unpublished setup candidates still
+inherit their setup signature/run guard, so a superseded build cannot activate.
+Revalidation and publication do not retarget completed assistant/setup runs or
+append new publication events to their historical records.
+
+Confirmed-build omission history: every pruned pipeline/type/relationship/action
+retains its direct validation failure or the named omitted type it depended on,
+read from that pass's own pre-prune report (failure sets are recomputed after
+every revalidation, never reused across passes). Dropped dashboard widgets are
+recorded separately in the assumptions note with their failed check names and
+details. The "no individual failure detail was retained" marker exists only for
+legacy publications that predated omission history; newly built reports must
+never contain it.
+
+Blank key warnings (warnings-only policy): the profiler counts empty-string
+values for text columns in the same per-column scan as nulls/distincts and
+stores the count as `blanks` on the column profile. Non-text columns and the
+memory-fallback path leave it unmeasured (absent, never zero). Validation
+reads the stored count — no extra queries, safe for schema-only bundles — and
+appends a "blank key value(s) present" warning to the passing Ontology check
+detail. The primaryKey flag and the type are never pruned for blanks alone.
+Legacy profiles predate the count and stay silent. Known audit cases pending
+re-import: ZBP_ADDRESS, ZBP_ADDRESS_WITH_ADDR_CODE, ZALCC_INFRACTION,
+ZPP_ADDRESS, ZFI_UNAUTH_IBAN, ZBP_BANK_ACCOUNT (1 of 4 rows), HR definitions
+sheet Unnamed:3 (1 of 2 rows). Empty string is not SQL NULL; these are record
+identity warnings, not duplicate-key failures.

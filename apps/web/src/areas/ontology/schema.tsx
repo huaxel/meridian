@@ -3,12 +3,14 @@ import { api } from "../../api";
 import { paths } from "../../paths";
 import { useWorkspace } from "../../ui";
 import { SuggestedOntologyView } from "../../suggested-ontology";
+import { PublicationValidation } from "./publication-validation";
 import type {
   OnboardingState,
   Resource,
   SuggestedEntity,
   SuggestedLink,
   SuggestedOntology,
+  ValidationReport,
 } from "../../../../../packages/shared/src";
 
 type Relationship = {
@@ -17,6 +19,8 @@ type Relationship = {
   toType: string;
   fromColumn: string;
   toColumn: string;
+  fromDatasetId?: string;
+  toDatasetId?: string;
 };
 
 // The published object types and relationships in the shape of the setup
@@ -72,25 +76,53 @@ export function publishedOntology(
     const from = idOf.get(r.fromType),
       to = idOf.get(r.toType);
     if (!from || !to) return [];
-    const c = confirmed?.links.find(
+    const candidates = confirmed?.links.filter(
       (l) =>
         confirmedName.get(l.from) === r.fromType &&
         confirmedName.get(l.to) === r.toType,
     );
-    const counts = previews["relation:" + r.name]?.rows?.[0];
+    const c = candidates?.find(
+      (l) =>
+        (!r.fromDatasetId || l.fromDatasetId === r.fromDatasetId) &&
+        (!r.toDatasetId || l.toDatasetId === r.toDatasetId) &&
+        (l.fromColumn === r.fromColumn ||
+          r.fromColumn.startsWith(`${l.fromColumn}_key`)) &&
+        (l.toColumn === r.toColumn ||
+          r.toColumn.startsWith(`${l.toColumn}_key`)),
+    ) || candidates?.[0];
+    const preview = previews["relation:" + r.name];
+    const counts = preview?.rows?.[0];
+    // Labels can fall back to an entity-pair candidate, but coverage cannot:
+    // another source/member relationship is not evidence for this mapping.
+    const coverage = candidates?.find(
+      (l) =>
+        l.fromDatasetId ===
+          (r.fromDatasetId || typeOf.get(r.fromType)?.data.datasetId) &&
+        l.toDatasetId ===
+          (r.toDatasetId || typeOf.get(r.toType)?.data.datasetId) &&
+        l.fromColumn === r.fromColumn &&
+        l.toColumn === r.toColumn,
+    );
+    const basis = counts ? preview?.matchBasis : coverage?.matchBasis;
+    const matchBasis =
+      basis === "measured" || basis === "asserted" ? basis : "unverified";
     return [
       {
         id: "r" + i,
         name: c?.name || r.name,
         from,
         to,
-        fromDatasetId: typeOf.get(r.fromType)?.data.datasetId || "",
+        fromDatasetId:
+          r.fromDatasetId || typeOf.get(r.fromType)?.data.datasetId || "",
         fromColumn: r.fromColumn,
-        toDatasetId: typeOf.get(r.toType)?.data.datasetId || "",
+        toDatasetId:
+          r.toDatasetId || typeOf.get(r.toType)?.data.datasetId || "",
         toColumn: r.toColumn,
-        totalRows: Number(counts?.total ?? c?.totalRows ?? 0),
-        matchedRows: Number(counts?.matched ?? c?.matchedRows ?? 0),
-        caseInsensitive: c?.caseInsensitive ?? false,
+        totalRows: Number(counts?.total ?? coverage?.totalRows ?? 0),
+        matchedRows: Number(counts?.matched ?? coverage?.matchedRows ?? 0),
+        matchBasis,
+        caseInsensitive:
+          preview?.caseInsensitive ?? coverage?.caseInsensitive ?? false,
         evidence: c?.evidence ?? "name",
       },
     ];
@@ -109,7 +141,8 @@ export function publishedOntology(
     entities: [...entities, ...streams],
     links,
     notes: (confirmed?.notes || []).filter((n) => n.kind === "merged"),
-    unplaced: [],
+    analyticalSources: confirmed?.analyticalSources || [],
+    unplaced: confirmed?.unplaced || [],
   };
 }
 
@@ -118,11 +151,13 @@ export function PublishedSchema({
   relationships,
   previews,
   datasets,
+  validation,
 }: {
   types: Resource[];
   relationships: Relationship[];
   previews: Record<string, any>;
   datasets: Resource[];
+  validation?: ValidationReport;
 }) {
   const { id } = useWorkspace();
   const setup = useQuery({
@@ -130,9 +165,8 @@ export function PublishedSchema({
     queryFn: () => api<OnboardingState>(`/workspaces/${id}/onboarding`),
     staleTime: 60000,
   });
-  const confirmed = setup.data?.buildRun?.data.ontology as
-    | SuggestedOntology
-    | undefined;
+  const confirmed = (setup.data?.ontology ||
+    setup.data?.buildRun?.data.ontology) as SuggestedOntology | undefined;
   const ontology = publishedOntology(
     types,
     relationships,
@@ -142,17 +176,20 @@ export function PublishedSchema({
   );
   const typeIds = new Set(types.map((t) => t.data.typeId || t.id));
   return (
-    <SuggestedOntologyView
-      readOnly
-      ontology={ontology}
-      datasets={datasets}
-      entityHref={(e) =>
-        typeIds.has(e.id)
-          ? paths.objectType(e.id)
-          : e.kind === "activity"
-            ? paths.dataset(e.anchorDatasetId)
-            : undefined
-      }
-    />
+    <>
+      <PublicationValidation report={validation} />
+      <SuggestedOntologyView
+        readOnly
+        ontology={ontology}
+        datasets={datasets}
+        entityHref={(e) =>
+          typeIds.has(e.id)
+            ? paths.objectType(e.id)
+            : e.kind === "activity"
+              ? paths.dataset(e.anchorDatasetId)
+              : undefined
+        }
+      />
+    </>
   );
 }

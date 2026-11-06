@@ -1,6 +1,14 @@
 import { DuckDBInstance, type DuckDBConnection } from "@duckdb/node-api";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, stat, realpath, link, copyFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  rm,
+  stat,
+  realpath,
+  link,
+  copyFile,
+} from "node:fs/promises";
 import { resolve, dirname, isAbsolute, sep } from "node:path";
 import {
   compactSample,
@@ -97,8 +105,7 @@ const partitionFileName = (key: string | null) => {
       ? "__null__"
       : raw === ""
         ? "__empty__"
-        : raw.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 60) ||
-          "__key__";
+        : raw.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 60) || "__key__";
   const tag = key === null || key === undefined ? "null" : "str";
   const hash = createHash("sha256")
     .update(tag + ":" + raw)
@@ -121,7 +128,13 @@ async function writePartitions(
     reuse?: { key: string; file: string; fingerprint: string }[];
   },
 ): Promise<
-  { key: string; file: string; rows: number; size: number; fingerprint: string }[]
+  {
+    key: string;
+    file: string;
+    rows: number;
+    size: number;
+    fingerprint: string;
+  }[]
 > {
   const { root, scope, version, column } = opts;
   // Any non-empty column name works here: it only ever reaches SQL through
@@ -150,9 +163,9 @@ async function writePartitions(
   await mkdir(partDir, { recursive: true });
   // The content fingerprint packs every result column, so any schema change
   // (added/removed/renamed column) alters it and blocks reuse of stale files.
-  const cols = (
-    await c.runAndReadAll("DESCRIBE result")
-  ).getRowObjectsJson().map((r) => String(r.column_name));
+  const cols = (await c.runAndReadAll("DESCRIBE result"))
+    .getRowObjectsJson()
+    .map((r) => String(r.column_name));
   const pack = "struct_pack(" + cols.map(quote).join(", ") + ")";
   const reuseMap = new Map((opts.reuse ?? []).map((r) => [r.key, r]));
   const partitions: {
@@ -188,9 +201,7 @@ async function writePartitions(
       if (!isMemoryLimitError(error)) throw error;
       rows = Number(
         (
-          await c.runAndReadAll(
-            `SELECT count(*) n FROM result WHERE ${where}`,
-          )
+          await c.runAndReadAll(`SELECT count(*) n FROM result WHERE ${where}`)
         ).getRowObjectsJson()[0].n,
       );
       fingerprint = rows + ":unknown";
@@ -366,7 +377,10 @@ export async function execute(
               })
             : [
                 input.sourcePath
-                  ? await resolveSource(input.sourcePath, input.sourceFingerprint!)
+                  ? await resolveSource(
+                      input.sourcePath,
+                      input.sourceFingerprint!,
+                    )
                   : resolve(scopeDir, input.version + ".parquet"),
               ];
         if (fileList.length === 0)
@@ -450,7 +464,9 @@ export async function execute(
     }
     // Partitioned ingest: write one Parquet per partition value and return a
     // manifest; the aggregate profile below is computed over the full result.
-    let partitions: { key: string; file: string; rows: number; size: number }[] | undefined;
+    let partitions:
+      | { key: string; file: string; rows: number; size: number }[]
+      | undefined;
     if (job.mode === "ingest" && job.partitionColumn) {
       partitions = await writePartitions(c, {
         root,
@@ -487,16 +503,29 @@ export async function execute(
     for (const [i, col] of schema.entries()) {
       const name = String(col.column_name),
         q = quote(name);
-      let null_count: unknown, distincts: unknown, exact = !approximateDistincts;
+      // Empty strings are not NULL and survive uniqueness checks, so text
+      // columns count them in the same scan. The match is strict scalar
+      // text: STRUCT/LIST/MAP spellings can embed "char"/"text" while
+      // rejecting '' comparisons, so those stay unmeasured.
+      const blankExpr = /^(VARCHAR|CHAR|TEXT|STRING)(\(.*\))?$/i.test(
+        String(col.column_type).trim(),
+      )
+        ? `, sum(CASE WHEN ${q} = '' THEN 1 ELSE 0 END) AS blanks`
+        : "";
+      let null_count: unknown,
+        distincts: unknown,
+        blanks: unknown,
+        exact = !approximateDistincts;
       if (exact) {
         try {
           const row = (
             await c.runAndReadAll(
-              `SELECT count(*)-count(${q}) AS null_count, count(DISTINCT ${q}) AS distincts FROM result`,
+              `SELECT count(*)-count(${q}) AS null_count, count(DISTINCT ${q}) AS distincts${blankExpr} FROM result`,
             )
           ).getRowObjectsJson()[0];
           null_count = row.null_count;
           distincts = row.distincts;
+          blanks = row.blanks;
         } catch (error) {
           if (!isMemoryLimitError(error)) throw error;
           approximateDistincts = true;
@@ -507,11 +536,12 @@ export async function execute(
         try {
           const row = (
             await c.runAndReadAll(
-              `SELECT count(*)-count(${q}) AS null_count, approx_count_distinct(${q}) AS distincts FROM result`,
+              `SELECT count(*)-count(${q}) AS null_count, approx_count_distinct(${q}) AS distincts${blankExpr} FROM result`,
             )
           ).getRowObjectsJson()[0];
           null_count = row.null_count;
           distincts = row.distincts;
+          blanks = row.blanks;
         } catch (error) {
           // The approximate pass can run out of memory too, so it must not be
           // the last line of defence: an unguarded second failure used to fail
@@ -529,6 +559,11 @@ export async function execute(
         type: String(col.column_type),
         nulls: Number(null_count),
         distinct: Number(distincts),
+        // Absent on non-text columns and on the memory-fallback path:
+        // unmeasured is not zero. The driver returns counts as strings.
+        ...(blanks === null || blanks === undefined
+          ? {}
+          : { blanks: Number(blanks) }),
         examples: stored.slice(0, 3).map((r) => r[name]),
         sensitive:
           /email|phone|ssn|password|secret|token|address|birth|credit/i.test(

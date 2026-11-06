@@ -23,6 +23,7 @@ import {
   Unlink,
 } from "lucide-react";
 import type {
+  AnalyticalSource,
   Resource,
   SuggestedEntity,
   SuggestedLink,
@@ -30,6 +31,7 @@ import type {
 } from "../../../packages/shared/src";
 import { Link } from "react-router-dom";
 import { number } from "./api";
+import { matchText } from "./link-match";
 import "./suggested-ontology.css";
 
 const sourceNames: Record<string, string> = {
@@ -702,10 +704,8 @@ function MiniMap({
   );
 }
 
-const matchText = (l: SuggestedLink) =>
-  `${number(l.matchedRows)} of ${number(l.totalRows)} matched${l.caseInsensitive ? " · matched ignoring case" : ""}`;
 const evidenceText = {
-  declared: "Declared as a foreign key",
+  declared: "Declared in source metadata or catalog",
   name: "Matched by column name and values",
   values: "Matched by values",
 };
@@ -737,12 +737,14 @@ export function SuggestedOntologyView({
   busy?: boolean;
   error?: string;
   // Edits confirmed earlier for this suggestion, restored when reviewing it again.
-  edits?: { excluded: string[]; names: Record<string, string> };
+  edits?: { excluded: string[]; names: Record<string, string>; predicates?: Record<string, { side: "from" | "to"; column: string; value: string }>; analyticalSources?: AnalyticalSource[] };
   // Set when the suggestion replaces the loading scene, so focus follows it.
   focusHeading?: boolean;
   onConfirm?: (choice: {
     excluded: string[];
     names: Record<string, string>;
+    predicates: Record<string, { side: "from" | "to"; column: string; value: string }>;
+    analyticalSources: AnalyticalSource[];
   }) => void;
   onBack?: () => void;
   // The published ontology inside the workspace: no editing, names link out,
@@ -758,6 +760,12 @@ export function SuggestedOntologyView({
   );
   const [names, setNames] = useState<Record<string, string>>(
     () => edits?.names || {},
+  );
+  const [predicates, setPredicates] = useState<Record<string, { side: "from" | "to"; column: string; value: string }>>(
+    () => edits?.predicates || {},
+  );
+  const [analyticalSources, setAnalyticalSources] = useState<AnalyticalSource[]>(
+    () => edits?.analyticalSources || ontology.analyticalSources || [],
   );
   const heading = useRef<HTMLHeadingElement>(null);
   const [editing, setEditing] = useState<string | null>(null);
@@ -909,6 +917,26 @@ export function SuggestedOntologyView({
     });
     if (pinned) setPinned(null);
   }
+  function toggleAnalyticalSource(datasetId: string) {
+    setAnalyticalSources((current) => {
+      const existing = current.find((source) => source.datasetId === datasetId);
+      return existing
+        ? current.filter((source) => source.datasetId !== datasetId)
+        : [...current, {
+            datasetId,
+            name: tableOf(datasetId),
+            description: "Reviewed analytical source; no row identity is asserted.",
+            role: "other",
+            dimensions: [],
+            measures: [],
+          }];
+    });
+  }
+  function updateAnalyticalSource(datasetId: string, patch: Partial<AnalyticalSource>) {
+    setAnalyticalSources((current) => current.map((source) =>
+      source.datasetId === datasetId ? { ...source, ...patch } : source,
+    ));
+  }
   function startRename(e: SuggestedEntity) {
     setDraft(nameOf(e.id));
     setEditing(e.id);
@@ -936,6 +964,10 @@ export function SuggestedOntologyView({
       names: Object.fromEntries(
         Object.entries(names).filter(([id]) => entity.has(id)),
       ),
+      predicates: Object.fromEntries(
+        Object.entries(predicates).filter(([id]) => links.some((link) => link.id === id)),
+      ),
+      analyticalSources,
     });
   }
 
@@ -964,6 +996,7 @@ export function SuggestedOntologyView({
             condensed into{" "}
             <strong>{plural(entities.length, "entity", "entities")}</strong>
             {links.length > 0 && ` and ${plural(links.length, "connection")}`}
+            {analyticalSources.length > 0 && ` · ${plural(analyticalSources.length, "analytical source")}`}
           </span>
         </div>
       ) : (
@@ -1357,13 +1390,7 @@ export function SuggestedOntologyView({
                         <strong>
                           {from} → {to}
                         </strong>{" "}
-                        <span>
-                          {number(l.matchedRows)} of {number(l.totalRows)}{" "}
-                          matched
-                          {l.caseInsensitive && (
-                            <em> · matched ignoring case</em>
-                          )}
-                        </span>{" "}
+                        <span>{matchText(l)}</span>{" "}
                         <code>
                           {tableOf(l.fromDatasetId)}.{l.fromColumn} →{" "}
                           {tableOf(l.toDatasetId)}.{l.toColumn}
@@ -1397,6 +1424,102 @@ export function SuggestedOntologyView({
         </section>
       )}
 
+      {readOnly && analyticalSources.length > 0 && (
+        <section className="so-notes" aria-labelledby={`${uid}-published-analytical-sources`}>
+          <h2 id={`${uid}-published-analytical-sources`}>Analytical sources · not record types</h2>
+          <p>These reviewed datasets are available for analysis, but have no row-level identity, record pages, actions, or graph relationships.</p>
+          <ul>
+            {analyticalSources.map((source) => (
+              <li key={source.datasetId}>
+                <strong>{source.name}</strong> · {tableOf(source.datasetId)} · {source.role}
+                {source.grain && <> · {source.grain}</>}
+                {source.dimensions.length > 0 && <> · Dimensions: {source.dimensions.join(", ")}</>}
+                {source.measures.length > 0 && <> · Measures: {source.measures.join(", ")}</>}
+                {source.description && <p>{source.description}</p>}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {!readOnly && links.some((link) => !link.predicate && link.predicateCandidates?.length) && (
+        <div className="so-notes">
+          <section aria-labelledby={`${uid}-scope`}>
+            <h2 id={`${uid}-scope`}>Optional relationship scope</h2>
+            <p>Links remain unscoped unless you choose an exact measured value. Source-row coverage and join-pair counts are shown separately.</p>
+            {links.filter((link) => !link.predicate && link.predicateCandidates?.length && visible(link)).map((link) => (
+              <label key={link.id} className="so-scope-choice">
+                <span>{nameOf(link.from)} → {nameOf(link.to)} ({link.fromColumn} → {link.toColumn})</span>
+                <select
+                  aria-label={`Optional scope for ${link.name}`}
+                  value={predicates[link.id] ? JSON.stringify(predicates[link.id]) : ""}
+                  onChange={(event) => {
+                    const encoded = event.currentTarget.value;
+                    setPredicates((current) => {
+                      const next = { ...current };
+                      if (!encoded) delete next[link.id];
+                      else next[link.id] = JSON.parse(encoded);
+                      return next;
+                    });
+                  }}
+                >
+                  <option value="">Unscoped — keep full relationship</option>
+                  {link.predicateCandidates!.flatMap((candidate) => candidate.values.map((value) => {
+                    const choice = { side: candidate.side, column: candidate.column, value: value.value };
+                    return <option key={JSON.stringify(choice)} value={JSON.stringify(choice)}>{candidate.side}.{candidate.column} = {value.value} · {number(value.candidateRows)} candidate rows · {number(value.matchedSourceRows)}/{number(value.eligibleSourceRows)} source rows · {number(value.joinPairs)} join pairs</option>;
+                  }))}
+                </select>
+              </label>
+            ))}
+          </section>
+        </div>
+      )}
+
+      {!readOnly && unplaced.length > 0 && (
+        <section className="so-notes" aria-labelledby={`${uid}-analytical-sources`}>
+          <h2 id={`${uid}-analytical-sources`}>Unplaced datasets for analysis</h2>
+          <p>No record identity was established from the available metadata; that does not prove a dataset has no key. Review its source and columns before classifying it. Classification does not create records or a stable row identity, and it is safe to leave datasets unplaced when their role or grain is unclear.</p>
+          {unplaced.map((datasetId) => {
+            const dataset = byDataset.get(datasetId),
+              selected = analyticalSources.find((source) => source.datasetId === datasetId),
+              columns = (dataset?.data.profile?.columns || []).filter((column: any) =>
+                !/STRUCT|MAP\(|\[\d*\]|UNION\(|^LIST|^JSON/i.test(column.type),
+              ),
+              numeric = columns.filter((column: any) => /^(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|UTINYINT|USMALLINT|UINTEGER|UBIGINT|FLOAT|REAL|DOUBLE|DECIMAL|NUMERIC)/i.test(column.type));
+            return (
+              <div className="simple-row" key={datasetId}>
+                <label>
+                  <input type="checkbox" checked={!!selected} disabled={busy} onChange={() => toggleAnalyticalSource(datasetId)} />
+                  <strong>{tableOf(datasetId)}</strong>
+                </label>
+                {selected && (
+                  <div className="so-analytical-source-fields">
+                    <p>No row-level browsing, record actions, or graph relationships will be created.</p>
+                    <label>Role
+                      <select value={selected.role} disabled={busy} onChange={(event) => updateAnalyticalSource(datasetId, { role: event.target.value as AnalyticalSource["role"] })}>
+                        <option value="fact">Fact</option><option value="dimension">Dimension</option><option value="other">Other / unclear</option>
+                      </select>
+                    </label>
+                    <label>Row grain (reviewer assertion)
+                      <input value={selected.grain || ""} disabled={busy} maxLength={500} placeholder="e.g. one balance per account and month" onChange={(event) => updateAnalyticalSource(datasetId, { grain: event.target.value || undefined })} />
+                    </label>
+                    <label>Dimensions
+                      <select multiple value={selected.dimensions} disabled={busy} onChange={(event) => updateAnalyticalSource(datasetId, { dimensions: Array.from(event.currentTarget.selectedOptions, (option) => option.value) })}>
+                        {columns.map((column: any) => <option key={column.name} value={column.name}>{column.name}</option>)}
+                      </select>
+                    </label>
+                    <label>Measures (numeric columns only)
+                      <select multiple value={selected.measures} disabled={busy} onChange={(event) => updateAnalyticalSource(datasetId, { measures: Array.from(event.currentTarget.selectedOptions, (option) => option.value) })}>
+                        {numeric.map((column: any) => <option key={column.name} value={column.name}>{column.name}</option>)}
+                      </select>
+                    </label>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </section>
+      )}
       {(merged.length > 0 || checks.length > 0 || unplaced.length > 0) && (
         <div className="so-notes">
           {merged.length > 0 && (

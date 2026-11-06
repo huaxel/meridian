@@ -235,6 +235,7 @@ export const HomeSummarySchema = z.object({
     sources: z.number(),
     pipelines: z.number(),
     objectTypes: z.number(),
+    analyticalSources: z.number(),
     objects: z.number(),
     dashboards: z.number(),
   }),

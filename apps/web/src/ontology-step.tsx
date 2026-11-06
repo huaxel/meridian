@@ -10,6 +10,7 @@ import {
 } from "./ontology-scene";
 import { SuggestedOntologyView } from "./suggested-ontology";
 import type {
+  AnalyticalSource,
   OnboardingState,
   Resource,
   SuggestedOntology,
@@ -232,6 +233,8 @@ export function OntologyStep({
   const confirm = async (choice: {
     excluded: string[];
     names: Record<string, string>;
+    predicates: Record<string, { side: "from" | "to"; column: string; value: string }>;
+    analyticalSources: AnalyticalSource[];
   }) => {
     if (!ontology) return;
     setConfirming(true);

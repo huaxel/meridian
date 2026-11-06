@@ -377,7 +377,7 @@ function OntologyPanel({ s }: { s?: HomeSummary }) {
       title="Ontology"
       subtitle={
         s
-          ? `${plural(types.length, "object type")} · ${plural(s.ontology.links.length, "link type")} · ${plural(s.counts.objects, "object")}`
+          ? `${plural(types.length, "object type")} · ${plural(s.counts.analyticalSources, "analytical source")} · ${plural(s.ontology.links.length, "link type")} · ${plural(s.counts.objects, "object")}`
           : undefined
       }
       actions={
@@ -516,6 +516,7 @@ export function HomePage() {
             <>
               <strong>{name}</strong> · {plural(s.counts.datasets, "dataset")} ·{" "}
               {plural(s.counts.objectTypes, "object type")} ·{" "}
+              {plural(s.counts.analyticalSources, "analytical source")} ·{" "}
               {plural(s.counts.objects, "object")}
             </>
           ) : (

@@ -1,3 +1,5 @@
+import { confirmedOntologyValue } from "./discovery/confirm.js";
+import { ONTOLOGY_DISCOVERY_REVISION } from "./discovery/revision.js";
 import type {
   OnboardingState,
   Resource,
@@ -157,6 +159,15 @@ export async function onboardingState(
           .filter((p) => p.data.status === "ready")
           .at(-1)
       : undefined;
+  const currentOntology =
+    m.ontologySuggestion?.signature === signature &&
+    m.ontologySuggestion.discoveryRevision === ONTOLOGY_DISCOVERY_REVISION
+      ? m.ontologySuggestion
+      : m.ontology?.signature === signature &&
+          m.ontology.value?.discoveryRevision === ONTOLOGY_DISCOVERY_REVISION
+        ? m.ontology.value
+        : undefined;
+  const approvedOntology = confirmedOntologyValue(m, signature);
   const activeDashboard =
     dashboards.find(
       (d) =>
@@ -207,17 +218,16 @@ export async function onboardingState(
           pending,
         }
       : undefined,
-    ontology:
-      m.ontologySuggestion?.signature === signature
-        ? m.ontologySuggestion
-        : undefined,
+    ontology: currentOntology,
     ontologyRun: ontologyRun || undefined,
     suggestJob: suggestJob ? publicResource(suggestJob) : undefined,
-    ontologyConfirmed: m.ontology?.signature === signature,
+    ontologyConfirmed: !!approvedOntology && !!currentOntology,
     ontologyEdits:
-      m.ontology?.signature === signature &&
+      approvedOntology &&
+      m.ontologySuggestion?.signature === signature &&
       m.ontology.edits &&
-      m.ontology.value?.hash === m.ontologySuggestion?.hash
+      (m.ontology.suggestionHash || m.ontology.value?.hash) ===
+        currentOntology?.hash
         ? m.ontology.edits
         : undefined,
   };

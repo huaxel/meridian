@@ -171,18 +171,20 @@ it("blocks invented columns, malicious SQL, unknown keys and cross-workspace inp
     queryDatasets(store, "foreign", [orders.id], "SELECT 1"),
   ).rejects.toThrow("unavailable");
 });
-it("moves a type to the only dataset holding its key and properties", async () => {
+it("repairs an opted-in AI draft using the only dataset holding its key and properties", async () => {
   const b = bundle();
   // A small model paired Order with the Customers dataset ID.
   b.ontology[1].datasetId = customers.id;
-  const report = await validateBundle(store, scope, b);
+  const report = await validateBundle(store, scope, b, {
+    allowDatasetRebinding: true,
+  });
   expect(report.valid, JSON.stringify(report.checks)).toBe(true);
   expect(b.ontology[1].datasetId).toBe(orders.id);
   // A type that already fits its dataset is never moved, even if others also fit.
   const fitting = bundle();
   fitting.ontology[0].datasetId = orders.id;
   fitting.ontology[0].properties = ["id"];
-  await validateBundle(store, scope, fitting);
+  await validateBundle(store, scope, fitting, { allowDatasetRebinding: true });
   expect(fitting.ontology[0].datasetId).toBe(orders.id);
 });
 it("binds approvals to input versions and preserves manual catalog edits across refreshes", async () => {

@@ -87,6 +87,25 @@ export function ProposalReview({ proposal: p }: { proposal: Resource }) {
           ))}
         </section>
       )}
+      {b.analyticalSources?.length > 0 && (
+        <section className="review-result" aria-labelledby="analytical-sources-heading">
+          <h3 id="analytical-sources-heading">Analytical sources · not record types</h3>
+          <p className="muted">These datasets can feed analytical queries, but have no row identity, record pages, actions, or graph relationships.</p>
+          <div className="simple-list">
+            {b.analyticalSources.map((source: any) => (
+              <div className="simple-row" key={source.datasetId}>
+                <div>
+                  <strong>{source.name} · {source.role}</strong>
+                  <p>{source.description}</p>
+                  {source.grain && <p>Reviewed grain: {source.grain}</p>}
+                  <p>Dimensions: {source.dimensions.map(fieldName).join(" · ") || "none"}</p>
+                  <p>Measures: {source.measures.map(fieldName).join(" · ") || "none"}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
       {b.assumptions.length > 0 && (
         <section className="review-result">
           <h3>Business assumptions</h3>
@@ -219,7 +238,13 @@ export function ProposalReview({ proposal: p }: { proposal: Resource }) {
                 action.run(async () => {
                   const next = await api(
                     `/workspaces/${id}/proposals/${p.id}`,
-                    JSON.parse(json),
+                    {
+                      version: 3,
+                      bundle: (() => {
+                        const edited = JSON.parse(json);
+                        return { ...edited, analyticalSources: edited.analyticalSources || [] };
+                      })(),
+                    },
                     "PUT",
                   );
                   setEditing(false);

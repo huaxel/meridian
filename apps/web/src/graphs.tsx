@@ -47,6 +47,7 @@ export function OntologyPage() {
             types={list}
             relationships={relations}
             previews={proposal?.data.validation?.previews || {}}
+            validation={proposal?.data.validation}
             datasets={datasets.data?.items || []}
           />
         </div>

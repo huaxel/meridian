@@ -1,15 +1,15 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { CatalogSchema } from "../../../../packages/shared/src/index.js";
+import { CatalogImportSchema } from "../../../../packages/shared/src/index.js";
 import { resource, transaction, type Store } from "../store.js";
 import type { RequestSchemas, RouteDeps } from "./deps.js";
 
-// General data-catalog import (v1): any catalog that helps Helix name entities,
+// Versioned data-catalog import: catalogs help Helix name entities,
 // link tables, assert keys and flag quality. Converters for specific upstreams
 // live outside this repo; Helix only speaks this format.
 export const catalogSchemas: RequestSchemas = {
   "POST /api/v1/workspaces/:w/catalog/import": z.object({
-    catalog: CatalogSchema,
+    catalog: CatalogImportSchema,
   }),
 };
 
@@ -21,11 +21,13 @@ export function registerCatalogRoutes(
   const { access } = deps;
   app.post("/api/v1/workspaces/:w/catalog/import", async (req) => {
     const a = await access(req, "editor");
-    const b = z.object({ catalog: CatalogSchema }).parse(req.body);
+    const b = z.object({ catalog: CatalogImportSchema }).parse(req.body);
     const data = {
       ...b.catalog,
-      importedAt: new Date().toISOString(),
-      importedBy: a.user.id,
+      ...(b.catalog.version === 1 ? {
+        importedAt: new Date().toISOString(),
+        importedBy: a.user.id,
+      } : {}),
     };
     await transaction(store, a.scope, async (tx) => {
       const existing = await tx.get("catalog");

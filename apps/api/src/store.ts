@@ -135,7 +135,7 @@ export class HelixStore implements Store {
       );
     }
     const current = await this.get("global", "schema");
-    if (current && current.data.version > 2)
+    if (current && current.data.version > 4)
       throw new Error(
         "Database schema is newer than this application; restore the matching release",
       );
@@ -147,7 +147,7 @@ export class HelixStore implements Store {
               "global",
               "migration",
               "Initial workspace schema",
-              { version: 2, appliedAt: now() },
+              { version: 4, appliedAt: now() },
               "schema",
             ),
           );
@@ -187,6 +187,49 @@ export class HelixStore implements Store {
         for (;;) {
           const s = await this.get("global", "schema");
           if (s && s.data.version >= 2) break;
+          await new Promise((r) => setTimeout(r, 500));
+        }
+      }
+    }
+    if (current.data.version < 3) {
+      if (isAppProcess()) {
+        // v2→v3 is metadata-only. The app owns the monotonic bump before
+        // any process can persist composite/predicate relationship semantics.
+        await transaction(this, "global", async (tx) => {
+          const s = await tx.get("schema");
+          if (s && s.data.version < 3)
+            tx.put({
+              ...s,
+              data: { ...s.data, version: 3, appliedAt: now() },
+              revision: s.revision + 1,
+              updatedAt: now(),
+            });
+        });
+      } else {
+        for (;;) {
+          const s = await this.get("global", "schema");
+          if (s && s.data.version >= 3) break;
+          await new Promise((r) => setTimeout(r, 500));
+        }
+      }
+    }
+    if (current.data.version < 4) {
+      if (isAppProcess()) {
+        // v3→v4 is metadata-only. Bump before analytical-source definitions can persist.
+        await transaction(this, "global", async (tx) => {
+          const s = await tx.get("schema");
+          if (s && s.data.version < 4)
+            tx.put({
+              ...s,
+              data: { ...s.data, version: 4, appliedAt: now() },
+              revision: s.revision + 1,
+              updatedAt: now(),
+            });
+        });
+      } else {
+        for (;;) {
+          const s = await this.get("global", "schema");
+          if (s && s.data.version >= 4) break;
           await new Promise((r) => setTimeout(r, 500));
         }
       }

@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { SourceSchema } from "./data.js";
 import { PipelineSchema } from "./pipelines.js";
-import { OntologySchema, RelationshipSchema } from "./ontology.js";
+import { AnalyticalSourceSchema, OntologySchema, RelationshipSchema } from "./ontology.js";
 import { DashboardSchema } from "./workspace.js";
 // Connector cards the sample data imitates; highlighted when it loads.
 export const sampleSources = [
@@ -122,6 +122,11 @@ export type ColumnProfile = {
   examples: unknown[];
   sensitive: boolean;
   primaryKey: boolean;
+  // Empty-string values in text columns. Empty is not SQL NULL, so it passes
+  // uniqueness/non-null checks while carrying no record identity. Recorded at
+  // import in the same per-column scan; undefined means unmeasured (legacy
+  // profiles or the memory-fallback path), never zero.
+  blanks?: number;
 };
 // Sample values are stored truncated: previews, examples and prompts show the
 // beginning of a value, and a table of large documents would otherwise store
@@ -161,8 +166,9 @@ export const BundleSchema = z.object({
     }),
   ),
   pipelines: z.array(PipelineSchema).max(10),
-  ontology: z.array(OntologySchema).max(20),
-  relationships: z.array(RelationshipSchema).max(30),
+  ontology: z.array(OntologySchema).max(1000),
+  analyticalSources: z.array(AnalyticalSourceSchema).max(1000).default([]),
+  relationships: z.array(RelationshipSchema).max(2000),
   dashboards: z.array(DashboardSchema).max(5),
   actions: z
     .array(
@@ -175,7 +181,63 @@ export const BundleSchema = z.object({
     .default([]),
 });
 export type Bundle = z.infer<typeof BundleSchema>;
+const validateScopedRelationships = (bundle: Bundle, ctx: z.RefinementCtx) => {
+  bundle.relationships.forEach((relationship, index) => {
+    if (!!relationship.predicate !== !!relationship.predicateBasis)
+      ctx.addIssue({ code: "custom", path: ["relationships", index], message: "Predicate value and provenance must be present together" });
+    const pairs = [
+      { fromColumn: relationship.fromColumn, toColumn: relationship.toColumn },
+      ...(relationship.additionalJoinPairs || []),
+    ];
+    if (new Set(pairs.map((pair) => pair.fromColumn)).size !== pairs.length || new Set(pairs.map((pair) => pair.toColumn)).size !== pairs.length)
+      ctx.addIssue({ code: "custom", path: ["relationships", index], message: "Relationship tuple components must be unique on each side" });
+  });
+};
+// V2 exchange protects scoped relationship fields; it cannot carry analytical sources.
+export const BundleV2Schema = BundleSchema.extend({
+  relationships: z.array(RelationshipSchema.strict()).max(2000),
+}).strict().superRefine((bundle, ctx) => {
+  validateScopedRelationships(bundle, ctx);
+  if (bundle.analyticalSources.length)
+    ctx.addIssue({ code: "custom", path: ["analyticalSources"], message: "Analytical sources require definitions version 3" });
+});
+// V3 adds explicit keyless analytical-source definitions; all fields remain strict.
+export const BundleV3Schema = BundleSchema.extend({
+  relationships: z.array(RelationshipSchema.strict()).max(2000),
+  analyticalSources: z.array(AnalyticalSourceSchema.strict()).max(1000),
+}).strict().superRefine(validateScopedRelationships);
+const legacyBundleHasNoScopedSemantics = (value: unknown) => {
+  if (!value || typeof value !== "object") return false;
+  const relationships = (value as { relationships?: unknown }).relationships;
+  const analyticalSources = (value as { analyticalSources?: unknown }).analyticalSources;
+  return (analyticalSources === undefined || (Array.isArray(analyticalSources) && analyticalSources.length === 0)) &&
+    Array.isArray(relationships) && relationships.every((r) =>
+      !!r && typeof r === "object" &&
+      !("additionalJoinPairs" in r) && !("predicate" in r) && !("predicateBasis" in r),
+    );
+};
+export const ProposalUpdateSchema = z.union([
+  BundleSchema,
+  z.object({ version: z.literal(3), bundle: BundleV3Schema }).strict(),
+]);
+export const DefinitionsImportSchema = z.union([
+  z.object({ version: z.literal(1), proposals: z.array(z.unknown()) }).superRefine((v, ctx) => {
+    v.proposals.forEach((proposal, i) => {
+      if (!legacyBundleHasNoScopedSemantics(proposal)) ctx.addIssue({ code: "custom", path: ["proposals", i], message: "Definitions v1 cannot contain scoped or composite relationships" });
+      else if (!BundleSchema.safeParse(proposal).success) ctx.addIssue({ code: "custom", path: ["proposals", i], message: "Invalid definitions v1 proposal" });
+    });
+  }),
+  z.object({ version: z.literal(2), proposals: z.array(BundleV2Schema) }).strict(),
+  z.object({ version: z.literal(3), proposals: z.array(BundleV3Schema) }).strict(),
+]);
+export type ValidationOmission = {
+  kind: "pipeline" | "objectType" | "relationship" | "action";
+  name: string;
+  reasons: string[];
+};
 export type ValidationReport = {
+  // Checks describe the surviving bundle; omissions explain removed definitions.
+  omissions?: ValidationOmission[];
   valid: boolean;
   checks: { name: string; passed: boolean; detail: string }[];
   previews: Record<string, unknown>;
@@ -319,6 +381,13 @@ export const SuggestedEntitySchema = z.object({
   // or a raw slug still needing a proper name.
   namedBy: z.enum(["catalog", "derived", "slug"]).optional(),
   key: z.string(),
+  // Record identity basis. Absent means single-column. A composite carries
+  // the resolved physical anchor columns; `key` stays a human-readable
+  // label ("a + b") that must never be quoted as a column. Promotion to a
+  // published identity happens only through a materialized surrogate plus
+  // measured uniqueness/non-null checks — see COMPOSITE-KEY-DESIGN.md.
+  keyKind: z.enum(["single", "composite"]).optional(),
+  compositeKey: z.array(z.string()).optional(),
   rows: z.number(),
   members: z.array(OntologyMemberSchema).min(1),
   properties: z.array(z.string()),
@@ -332,9 +401,18 @@ export const SuggestedLinkSchema = z.object({
   fromColumn: z.string(),
   toDatasetId: z.string(),
   toColumn: z.string(),
-  // Non-null source values and how many matched the target.
+  // Legacy counts can be asserted placeholders, not measured coverage.
+  // An absent basis is unverified; do not infer measurement from `evidence`.
   totalRows: z.number(),
   matchedRows: z.number(),
+  matchBasis: z.enum(["measured", "asserted", "unverified"]).optional(),
+  additionalJoinPairs: z.array(z.object({ fromColumn: z.string().min(1), toColumn: z.string().min(1) }).strict()).min(1).optional(),
+  predicate: z.object({ side: z.enum(["from", "to"]), column: z.string().min(1), op: z.literal("="), value: z.string() }).strict().optional(),
+  predicateBasis: z.enum(["asserted", "confirmed"]).optional(),
+  predicateCandidates: z.array(z.object({
+    side: z.enum(["from", "to"]), column: z.string(),
+    values: z.array(z.object({ value: z.string(), candidateRows: z.number(), matchedSourceRows: z.number(), eligibleSourceRows: z.number(), joinPairs: z.number() })),
+  })).optional(),
   caseInsensitive: z.boolean(),
   evidence: z.enum(["declared", "name", "values"]),
 });
@@ -347,6 +425,8 @@ export const OntologyNoteSchema = z.object({
 });
 export const SuggestedOntologySchema = z.object({
   signature: z.string(),
+  // Optional for persisted suggestions created before versioned discovery.
+  discoveryRevision: z.number().int().positive().optional(),
   hash: z.string(),
   summary: z.string(),
   // True once the AI has written the summary and descriptions.
@@ -358,19 +438,25 @@ export const SuggestedOntologySchema = z.object({
   links: z.array(SuggestedLinkSchema),
   notes: z.array(OntologyNoteSchema),
   unplaced: z.array(z.string()),
+  // Owner-reviewed classification of keyless datasets; discovery itself never populates this.
+  analyticalSources: z.array(AnalyticalSourceSchema).optional(),
 });
 export type SuggestedOntology = z.infer<typeof SuggestedOntologySchema>;
 export type SuggestedEntity = z.infer<typeof SuggestedEntitySchema>;
 export type SuggestedLink = z.infer<typeof SuggestedLinkSchema>;
 export const OntologyConfirmSchema = z.object({
   hash: z.string(),
-  excluded: z.array(z.string()).max(50).default([]),
+  excluded: z.array(z.string()).max(1000).default([]),
   names: z.record(z.string(), z.string().min(1).max(60)).default({}),
+  predicates: z.record(z.string(), z.object({ side: z.enum(["from", "to"]), column: z.string().min(1), value: z.string() })).default({}),
+  analyticalSources: z.array(AnalyticalSourceSchema).max(1000).default([]),
 });
-export type OntologyConfirm = z.infer<typeof OntologyConfirmSchema>;
+export type OntologyConfirm = z.input<typeof OntologyConfirmSchema>;
 export const OntologyEditsSchema = z.object({
   excluded: z.array(z.string()),
   names: z.record(z.string(), z.string()),
+  predicates: z.record(z.string(), z.object({ side: z.enum(["from", "to"]), column: z.string(), value: z.string() })).optional(),
+  analyticalSources: z.array(AnalyticalSourceSchema).max(1000).optional(),
 });
 export const SampleProgressSchema = z.object({
   total: z.number(),

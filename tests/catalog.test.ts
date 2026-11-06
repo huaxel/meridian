@@ -213,7 +213,7 @@ afterEach(async () => {
 
 it("imports, fetches and replaces a general catalog", async () => {
   const bad = await request("POST", "/catalog/import", {
-    catalog: { version: 2, tables: [], joins: [] },
+    catalog: { version: 3, tables: [], joins: [] },
   });
   expect(bad.statusCode).toBe(400);
   const first = await request("POST", "/catalog/import", { catalog });

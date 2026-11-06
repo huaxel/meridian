@@ -5,6 +5,7 @@
 // (publication bundle + overview dashboard). Existing importers are unchanged.
 export { q, lit, plural, sourceLabel, tableName, entityName } from "./discovery/names.js";
 export { type SuggestStage, suggestOntology } from "./discovery/suggest.js";
+export { ONTOLOGY_DISCOVERY_REVISION } from "./discovery/revision.js";
 export { entityColumns, entityColumn } from "./discovery/columns.js";
-export { confirmOntology, ontologyGoal } from "./discovery/confirm.js";
+export { confirmOntology, ontologyGoal, resolvedOntologyDigest } from "./discovery/confirm.js";
 export { ontologyBundle, overviewDashboard } from "./discovery/bundle.js";

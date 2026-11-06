@@ -19,6 +19,9 @@ export type Info = {
   columns: ColumnProfile[];
   rows: number;
   key?: string;
+  // Resolved physical columns of a catalog composite declaration. Joint
+  // uniqueness is never established here; promotion happens at bundle time.
+  composite?: string[];
   alt: Set<string>;
 };
 export type Col = {

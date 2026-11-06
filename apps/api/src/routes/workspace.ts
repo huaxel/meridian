@@ -3,8 +3,11 @@ import { z } from "zod";
 import { Readable } from "node:stream";
 import {
   BundleSchema,
+  DefinitionsImportSchema,
+  ProposalUpdateSchema,
   ProviderSchema,
   ActivityKindSchema,
+  type Bundle,
   collapseActivity,
   describeActivity,
   type ActivityItem,
@@ -30,14 +33,11 @@ import {
 
 export const workspaceSchemas: RequestSchemas = {
   "PUT /api/v1/workspaces/:w/provider": ProviderSchema,
-  "PUT /api/v1/workspaces/:w/proposals/:id": BundleSchema,
+  "PUT /api/v1/workspaces/:w/proposals/:id": ProposalUpdateSchema,
   "POST /api/v1/workspaces/:w/proposals/:id/publish": z.object({
     hash: z.string(),
   }),
-  "POST /api/v1/workspaces/:w/definitions/import": z.object({
-    version: z.literal(1),
-    proposals: z.array(BundleSchema),
-  }),
+  "POST /api/v1/workspaces/:w/definitions/import": DefinitionsImportSchema,
   "POST /api/v1/workspaces/:w/tokens": z.object({
     name: z.string(),
     readOnly: z.boolean(),
@@ -184,6 +184,7 @@ export function registerWorkspaceRoutes(
       dashboards,
       pipelines,
       objectTypes,
+      analyticalSources,
       publications,
     ] = await Promise.all(
       [
@@ -194,6 +195,7 @@ export function registerWorkspaceRoutes(
         "dashboard",
         "pipeline",
         "objectType",
+        "analyticalSource",
         "publication",
       ].map((k) => store.list(a.scope, k)),
     );
@@ -366,6 +368,7 @@ export function registerWorkspaceRoutes(
         sources: kept.length,
         pipelines: pipelines.filter(live).length,
         objectTypes: types.length,
+        analyticalSources: analyticalSources.filter(live).length,
         objects: types.reduce((n, t) => n + (t.data.objectCount || 0), 0),
         dashboards: dashboards.filter(live).length,
       },
@@ -445,6 +448,7 @@ export function registerWorkspaceRoutes(
       "dashboard",
       "pipeline",
       "objectType",
+      "analyticalSource",
     ];
     const result = Object.fromEntries(
       await Promise.all(
@@ -587,7 +591,30 @@ export function registerWorkspaceRoutes(
     const a = await access(req, "editor"),
       old = await store.get(a.scope, req.params.id);
     assert(old?.kind === "proposal", "Proposal unavailable", 404);
-    return saveProposal(store, a.scope, BundleSchema.parse(req.body), old.id);
+    const update = ProposalUpdateSchema.parse(req.body),
+      versioned = "version" in update,
+      bundle = versioned ? update.bundle : update,
+      previous = BundleSchema.parse(old.data.bundle);
+    const semantic = (r: (typeof bundle.relationships)[number]) => JSON.stringify([
+      [...(r.additionalJoinPairs || [])].sort((a, b) => a.fromColumn.localeCompare(b.fromColumn) || a.toColumn.localeCompare(b.toColumn)),
+      r.predicate || null,
+      r.predicateBasis || null,
+    ]);
+    if (!versioned) {
+      for (const rel of previous.relationships.filter((r) => r.additionalJoinPairs !== undefined || r.predicate)) {
+        const updated = bundle.relationships.find((r) => r.name === rel.name);
+        assert(updated && semantic(updated) === semantic(rel), "Legacy proposal updates cannot remove or alter scoped/composite relationship semantics", 409);
+      }
+      const sourceMeaning = (items: Bundle["analyticalSources"]) => JSON.stringify(
+        [...items].map((source) => ({
+          ...source,
+          dimensions: [...source.dimensions].sort(),
+          measures: [...source.measures].sort(),
+        })).sort((a, b) => a.datasetId.localeCompare(b.datasetId)),
+      );
+      assert(sourceMeaning(bundle.analyticalSources) === sourceMeaning(previous.analyticalSources), "Legacy proposal updates cannot remove or alter analytical-source semantics", 409);
+    }
+    return saveProposal(store, a.scope, bundle, old.id);
   });
   app.post("/api/v1/workspaces/:w/proposals/:id/validate", async (req: any) => {
     const a = await access(req, "editor"),
@@ -688,21 +715,21 @@ export function registerWorkspaceRoutes(
   app.get("/api/v1/workspaces/:w/definitions/export", async (req) => {
     const a = await access(req);
     const ws = await store.get(a.scope, "workspace");
-    return {
-      version: 1,
-      proposals: (await store.list(a.scope, "proposal"))
-        .filter((p) => p.data.publishedGeneration === ws?.data.activeGeneration)
-        .map((p) => p.data.bundle),
-    };
+    const proposals = (await store.list(a.scope, "proposal"))
+      .filter((p) => p.data.publishedGeneration === ws?.data.activeGeneration)
+      .map((p) => BundleSchema.parse(p.data.bundle));
+    const version = proposals.some((bundle) => bundle.analyticalSources.length) ? 3 :
+      proposals.some((bundle) => bundle.relationships.some((r) => r.additionalJoinPairs !== undefined || r.predicate)) ? 2 : 1;
+    return { version, proposals };
   });
   app.post("/api/v1/workspaces/:w/definitions/import", async (req) => {
     const a = await access(req, "editor"),
-      b = z
-        .object({ version: z.literal(1), proposals: z.array(BundleSchema) })
-        .parse(req.body);
+      b = DefinitionsImportSchema.parse(req.body);
     const items = [];
-    for (const bundle of b.proposals)
+    for (const raw of b.proposals) {
+      const bundle = BundleSchema.parse(raw);
       items.push(await saveProposal(store, a.scope, bundle));
+    }
     return { items };
   });
 }

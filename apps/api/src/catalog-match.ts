@@ -14,7 +14,7 @@ export function normTable(name: string): string {
 }
 // A physical column for a catalog (SAP) key: exact match first, else a column
 // whose name ends with the key (FrenchLabel_GPART resolves GPART). Returns the
-// physical column name or undefined when the key is absent.
+// physical column name or undefined when the key is absent or ambiguous.
 export function resolveColumn(
   columns: { name: string }[],
   key: string,
@@ -22,22 +22,45 @@ export function resolveColumn(
   const want = key.toUpperCase().replace(/[^A-Z0-9]+/g, "");
   if (!want) return undefined;
   const norm = (n: string) => n.toUpperCase().replace(/[^A-Z0-9]+/g, "");
-  const exact = columns.find((c) => norm(c.name) === want);
-  if (exact) return exact.name;
-  const suffix = columns.find(
-    (c) => norm(c.name).endsWith(want) && norm(c.name).length > want.length,
+  const names = [...new Set(columns.map((c) => c.name))];
+  const unique = (matches: string[]) =>
+    matches.length === 1 ? matches[0] : undefined;
+  // A literal spelling is stronger than punctuation-stripped matching.
+  const literal = names.filter(
+    (name) => name.toUpperCase() === key.toUpperCase(),
   );
-  if (suffix) return suffix.name;
+  if (literal.length) return unique(literal);
+  const exact = names.filter((name) => norm(name) === want);
+  if (exact.length) return unique(exact);
+  const suffix = names.filter(
+    (name) => norm(name).endsWith(want) && norm(name).length > want.length,
+  );
+  if (suffix.length) return unique(suffix);
   // Dotted label-qualified columns (Taxpayer.return_z019): the leading label
-  // names the key the column carries.
-  const labeled = columns.find((c) => {
-    const [first] = c.name.split(".");
+  // names the key the column carries. Never break ties by header order.
+  const labeled = names.filter((name) => {
+    const [first] = name.split(".");
     return first !== undefined && norm(first) === want;
   });
-  return labeled?.name;
+  return unique(labeled);
 }
-// Unioned columns per normalized table across all same-name datasets (extract
-// variants): a key resolves when ANY variant carries it, never first-wins.
+// Resolve only declared single-column alternatives. Composite declarations are
+// metadata, not physical columns or a proven materialized record identity.
+export function resolveSingleCatalogKey(
+  columns: { name: string }[],
+  keys?: string[][],
+): string | undefined {
+  for (const key of keys || []) {
+    if (key.length !== 1) continue;
+    const column = resolveColumn(columns, key[0]);
+    if (column) return column;
+  }
+  return undefined;
+}
+
+// Unioned inventory per normalized table across extract variants. Resolve
+// physical keys within each variant, not against this union: separate extracts
+// can use different aliases without being internally ambiguous.
 // Datasets without profile columns are skipped (unimported or keyless).
 export function unionTableColumns(
   datasets: { name?: string; data?: { profile?: { columns: { name: string }[] } } }[],

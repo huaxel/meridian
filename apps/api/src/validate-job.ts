@@ -1,21 +1,15 @@
 import type { Resource } from "../../../packages/shared/src/index.js";
-import { CatalogSchema } from "../../../packages/shared/src/index.js";
-import {
-  indexCatalog,
-  normTable,
-  resolveColumn,
-  unionTableColumns,
-} from "./catalog-match.js";
+import { CatalogImportSchema } from "../../../packages/shared/src/index.js";
+import { normTable, resolveColumn } from "./catalog-match.js";
 import { transaction, type Store } from "./store.js";
 
 // Advisory catalog audit (no executor): classifies every catalog join as
 // applied or skipped (out-of-scope table, unresolvable key column,
 // same-entity, duplicate) and records the headline in the suggestion summary.
-// Per-link value coverage is NOT re-measured here — curated joins carry the
-// upstream catalog's own golden measurements; Helix only verifies that each
-// join resolves to real in-scope tables and columns (unresolvable joins are
-// never emitted as links in the first place). Advisory only: never blocks,
-// drops, or re-hashes the suggestion (the summary is outside the confirm hash).
+// Value coverage is not measured here: catalog assertions are not observations.
+// Resolution uses retained workspace profiles, not source-file reads. Advisory
+// only: never blocks, drops, or re-hashes the suggestion (the summary is outside
+// the confirm hash).
 export async function runValidateJob(
   store: Store,
   scope: string,
@@ -33,13 +27,21 @@ export async function runValidateJob(
   const suggestion = workspace?.data?.onboarding?.ontologySuggestion;
   if (!suggestion || suggestion.signature !== onboardingSignature) return null;
   if (!catalogStored) return null;
-  const parsed = CatalogSchema.safeParse(catalogStored.data);
+  const parsed = CatalogImportSchema.safeParse(catalogStored.data);
   if (!parsed.success) return null;
   const catalog = parsed.data;
   if (!catalog.joins.length) return null;
-  const unioned = unionTableColumns(datasets as any[]);
-  const byTable = new Map<string, { columns: { name: string }[] }>();
-  for (const [n, columns] of unioned) byTable.set(n, { columns });
+  // Resolve within each extract, as discovery does. Unioning aliases from
+  // separate extracts can create ambiguity that exists in neither source.
+  const byTable = new Map<string, { columns: { name: string }[] }[]>();
+  for (const d of datasets) {
+    const columns = d.data.profile?.columns;
+    if (!Array.isArray(columns)) continue;
+    const name = normTable(d.name);
+    const variants = byTable.get(name) || [];
+    variants.push({ columns });
+    byTable.set(name, variants);
+  }
   const appliedIds = new Set(
     ((suggestion.links as any[]) || [])
       .map((l) => l.id)
@@ -56,8 +58,8 @@ export async function runValidateJob(
       outOfScope++;
       continue;
     }
-    const aCol = resolveColumn(a.columns, j.leftKey),
-      bCol = resolveColumn(b.columns, j.rightKey);
+    const aCol = a.some((variant) => resolveColumn(variant.columns, j.leftKey)),
+      bCol = b.some((variant) => resolveColumn(variant.columns, j.rightKey));
     if (!aCol || !bCol) missingColumn++;
   }
   const applied = appliedIds.size;

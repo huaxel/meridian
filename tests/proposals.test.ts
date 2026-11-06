@@ -3,6 +3,7 @@ import { MemoryStore, resource, transaction } from "../apps/api/src/store.js";
 import { buildWorkspace } from "../apps/api/src/assistant.js";
 import { onboardingState } from "../apps/api/src/onboarding-state.js";
 import { Provider } from "../apps/api/src/providers.js";
+import { ONTOLOGY_DISCOVERY_REVISION } from "../apps/api/src/discovery/revision.js";
 
 const store = new MemoryStore();
 const scope = "proposals_" + Date.now();
@@ -78,6 +79,7 @@ async function setup(count: number) {
       onboarding: {
         ontologySuggestion: {
           signature: "sig",
+          discoveryRevision: ONTOLOGY_DISCOVERY_REVISION,
           hash: "h",
           summary: "",
           described: false,

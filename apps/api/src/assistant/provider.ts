@@ -10,14 +10,33 @@ import type { Store } from "../store.js";
 import { assert, digest, unseal } from "../security.js";
 import { config } from "../config.js";
 
-export const proposalHash = (bundle: Bundle, report: ValidationReport) =>
-  digest(
-    JSON.stringify({
-      bundle,
-      inputVersions: report.inputVersions,
-      baseGeneration: report.baseGeneration || null,
-    }),
-  );
+export const proposalHash = (bundle: Bundle, report: ValidationReport) => {
+  const canonicalBundle = {
+    ...bundle,
+    relationships: bundle.relationships.map((relationship) =>
+      relationship.additionalJoinPairs
+        ? {
+            ...relationship,
+            additionalJoinPairs: [...relationship.additionalJoinPairs].sort(
+              (a, b) => a.fromColumn.localeCompare(b.fromColumn) || a.toColumn.localeCompare(b.toColumn),
+            ),
+          }
+        : relationship,
+    ),
+    analyticalSources: [...bundle.analyticalSources]
+      .map((source) => ({
+        ...source,
+        dimensions: [...source.dimensions].sort(),
+        measures: [...source.measures].sort(),
+      }))
+      .sort((a, b) => a.datasetId.localeCompare(b.datasetId) || a.name.localeCompare(b.name)),
+  };
+  return digest(JSON.stringify({
+    bundle: canonicalBundle,
+    inputVersions: report.inputVersions,
+    baseGeneration: report.baseGeneration || null,
+  }));
+};
 export async function providerSettings(store: Store, scope: string) {
   const r = await store.get(scope, "provider");
   return r

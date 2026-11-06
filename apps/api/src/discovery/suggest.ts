@@ -1,6 +1,6 @@
 import {
   type Catalog,
-  CatalogSchema,
+  parseCatalog,
   type ColumnProfile,
   datasetTable,
   type Resource,
@@ -9,15 +9,19 @@ import {
   type SuggestedOntology,
 } from "../../../../packages/shared/src/index.js";
 import { queryDatasets } from "../datasets.js";
+import { relationshipJoinCondition } from "../relationship-sql.js";
 import {
   derivedBusinessName,
   indexCatalog,
   normTable,
   resolveColumn,
+  resolveSingleCatalogKey,
 } from "../catalog-match.js";
 import { digest } from "../security.js";
 import type { Store } from "../store.js";
 import { entityColumns } from "./columns.js";
+import { sourceLinkIdentity } from "./link-identity.js";
+import { ONTOLOGY_DISCOVERY_REVISION } from "./revision.js";
 import {
   type Col,
   declaredKeys,
@@ -95,19 +99,49 @@ export async function suggestOntology(
   let catalog: Catalog | undefined;
   try {
     const stored = await store.get(scope, "catalog");
-    if (stored) catalog = CatalogSchema.parse(stored.data);
+    if (stored) catalog = parseCatalog(stored.data);
   } catch {
     catalog = undefined;
   }
   const catalogTables = catalog ? indexCatalog(catalog) : new Map();
   const catalogFor = (datasetName: string) =>
     catalogTables.get(normTable(datasetName));
+  const keyReviews: { info: Info; text: string }[] = [];
+  const catalogJoinReviews: string[] = [];
   for (const x of infos) {
     x.key = ownKey(x);
     const entry = catalogFor(x.d.name) || catalogFor(x.table);
-    if (!x.key && entry?.keys?.length)
-      // Asserted (possibly composite) key, trusted on import.
-      x.key = entry.keys[0].join(" + ");
+    if (!x.key && entry?.keys?.length) {
+      const physical = resolveSingleCatalogKey(x.columns, entry.keys);
+      // First fully-resolving multi-column declaration, resolved per
+      // extract variant against this dataset's own columns. The components
+      // are physical columns; joint uniqueness is NOT established here.
+      let composite: string[] | undefined;
+      if (!physical)
+        for (const k of (entry.keys ?? []) as string[][]) {
+          if (k.length < 2) continue;
+          const resolved = k.map((c: string) => resolveColumn(x.columns, c));
+          if (resolved.every((c: string | undefined) => c)) {
+            composite = resolved as string[];
+            break;
+          }
+        }
+      // Preserve composite/unresolved declarations as review candidates, not
+      // invented physical columns. Validation still requires the profile's
+      // unique, non-null key flag; declarations do not set that flag.
+      x.key = physical || (composite ?? entry.keys[0]).join(" + ");
+      x.composite = composite;
+      keyReviews.push({
+        info: x,
+        text: physical
+          ? `${x.d.name} uses catalog-declared key "${physical}"; uniqueness and non-nullness have not been verified.`
+          : composite
+            ? `${x.d.name} declares composite key (${composite.join(" + ")}); a single-column record identity has not been established. Joint uniqueness and non-nullness have not been verified.`
+            : entry.keys[0].length > 1
+              ? `${x.d.name} declares composite key (${x.key}); a single-column record identity has not been established.`
+              : `Catalog key "${x.key}" for ${x.d.name} cannot be resolved unambiguously to a source column; record identity needs review.`,
+      });
+    }
     for (const c of x.columns)
       if (
         c.name !== x.key &&
@@ -598,6 +632,11 @@ export async function suggestOntology(
       kind: d.kind,
       anchorDatasetId: d.anchor.d.id,
       key: d.key,
+      // The anchor's resolved composite, if any. `key` stays a display
+      // label; only bundle promotion may turn components into identity.
+      ...(d.anchor.composite?.length
+        ? { keyKind: "composite" as const, compositeKey: d.anchor.composite }
+        : {}),
       rows: d.anchor.rows,
       members: d.members,
       properties: [],
@@ -631,6 +670,7 @@ export async function suggestOntology(
       toColumn: e.B.name,
       totalRows: e.total,
       matchedRows: e.matched,
+      matchBasis: "measured",
       caseInsensitive: e.caseRows > 0,
       evidence: e.evidence,
     };
@@ -659,29 +699,50 @@ export async function suggestOntology(
       for (const m of e.members)
         if (!entityByDataset.has(m.datasetId))
           entityByDataset.set(m.datasetId, e.id);
-    const covered = new Set(
-      links.map((l) =>
-        [
-          `${l.fromDatasetId}|${l.fromColumn}|${l.toDatasetId}|${l.toColumn}`,
-          `${l.toDatasetId}|${l.toColumn}|${l.fromDatasetId}|${l.fromColumn}`,
-        ].join("~"),
-      ),
-    );
+    const covered = new Set(links.map(sourceLinkIdentity));
     for (const j of catalog.joins) {
       const a = pick(j.leftTable, j.leftKey),
         b = pick(j.rightTable, j.rightKey);
-      if (!a || !b) continue;
-      const aCol = resolveColumn(a.columns, j.leftKey)!,
-        bCol = resolveColumn(b.columns, j.rightKey)!;
+      if (!a || !b) {
+        catalogJoinReviews.push(`Catalog join ${j.leftTable}.${j.leftKey} → ${j.rightTable}.${j.rightKey} was skipped: a primary endpoint variant or column did not resolve.`);
+        continue;
+      }
+      const aCol = resolveColumn(a.columns, j.leftKey),
+        bCol = resolveColumn(b.columns, j.rightKey);
+      const extra = "additionalJoinPairs" in j ? j.additionalJoinPairs || [] : [];
+      const additionalJoinPairs = extra.map((pair) => ({
+        fromColumn: resolveColumn(a.columns, pair.leftKey),
+        toColumn: resolveColumn(b.columns, pair.rightKey),
+      }));
+      const pred = "predicate" in j ? j.predicate : undefined;
+      const predInfo = pred?.side === "left" ? a : b;
+      const predicateColumn = pred && predInfo ? resolveColumn(predInfo.columns, pred.column) : undefined;
+      const predicateType = predicateColumn && predInfo?.columns.find((c) => c.name === predicateColumn)?.type;
+      const predicateValid = !pred || (!!predicateColumn && typeof pred.value === "string" && !!predicateType && /^(VARCHAR|CHAR|TEXT|STRING)(\s*\(\s*\d+\s*\))?$/i.test(predicateType));
+      const allFromColumns = [aCol, ...additionalJoinPairs.map((p) => p.fromColumn)];
+      const allToColumns = [bCol, ...additionalJoinPairs.map((p) => p.toColumn)];
+      const unique = (values: unknown[]) => new Set(values).size === values.length;
+      if (!aCol || !bCol || additionalJoinPairs.some((p) => !p.fromColumn || !p.toColumn) || !unique(allFromColumns) || !unique(allToColumns) || !predicateValid) {
+        catalogJoinReviews.push(`Catalog join ${j.leftTable}.${j.leftKey} → ${j.rightTable}.${j.rightKey} was skipped: a composite component or text predicate did not resolve safely.`);
+        continue;
+      }
       const from = entityByDataset.get(a.d.id),
         to = entityByDataset.get(b.d.id);
       if (!from || !to || from === to) continue;
-      if (
-        covered.has(
-          `${a.d.id}|${aCol}|${b.d.id}|${bCol}~${b.d.id}|${bCol}|${a.d.id}|${aCol}`,
-        )
-      )
-        continue;
+      const mapping = {
+        from,
+        to,
+        fromDatasetId: a.d.id,
+        fromColumn: aCol,
+        toDatasetId: b.d.id,
+        toColumn: bCol,
+        ...(additionalJoinPairs.length ? { additionalJoinPairs: additionalJoinPairs as { fromColumn: string; toColumn: string }[] } : {}),
+        ...(pred && predicateColumn ? { predicate: { side: pred.side === "left" ? "from" as const : "to" as const, column: predicateColumn, op: "=" as const, value: pred.value }, predicateBasis: "asserted" as const } : {}),
+        caseInsensitive: false,
+      };
+      const identity = sourceLinkIdentity(mapping);
+      if (covered.has(identity)) continue;
+      covered.add(identity);
       let id =
         `catalog-${normTable(j.leftTable)}-${j.leftKey}-${normTable(j.rightTable)}-${j.rightKey}`
           .toLowerCase()
@@ -691,15 +752,10 @@ export async function suggestOntology(
       links.push({
         id,
         name: "references",
-        from,
-        to,
-        fromDatasetId: a.d.id,
-        fromColumn: aCol,
-        toDatasetId: b.d.id,
-        toColumn: bCol,
+        ...mapping,
         totalRows: a.rows,
         matchedRows: a.rows,
-        caseInsensitive: false,
+        matchBasis: "asserted",
         evidence: "declared",
       });
     }
@@ -716,7 +772,17 @@ export async function suggestOntology(
   for (const d of drafts)
     d.degree = links.filter((l) => l.from === d.id || l.to === d.id).length;
 
-  const notes: SuggestedOntology["notes"] = [];
+  const notes: SuggestedOntology["notes"] = keyReviews.map(
+    ({ info: sourceInfo, text }) => {
+      const entity = entityOf.get(sourceInfo);
+      return {
+        kind: "unmatched" as const,
+        text,
+        ...(entity ? { entities: [entity.id] } : {}),
+      };
+    },
+  );
+  notes.push(...catalogJoinReviews.map((text) => ({ kind: "unlinked" as const, text })));
   const info = (id: string) => infos.find((x) => x.d.id === id)!;
   // Other 1:1 matches inside an entity, struct fields included, confirm the merge;
   // the join's own column pair, read in reverse, is not a second match.
@@ -808,8 +874,57 @@ export async function suggestOntology(
     new Set(infos.map((x) => (x.source === "upload" ? "upload" : x.system)))
       .size,
   );
+  // Candidate filters are measured evidence only; no value is selected here.
+  // Restrict probes to recognizable scope dimensions and cap both candidate
+  // columns and values so discovery never materializes source rows.
+  const scopeNames = /^(SPRAS|LANG|LANGU|LANGUAGE|LOCALE|OBJECTTYPE|MANDT|RCLNT|CLIENT|BUKRS|RBUKRS|GJAHR|RLDNR|LEDGER)$/i;
+  const textType = (type: string) => /^(VARCHAR|CHAR|TEXT|STRING)(\s*\(\s*\d+\s*\))?$/i.test(type.trim());
+  const candidateLinks = [...links]
+    .filter((link) => !link.predicate && link.evidence === "declared")
+    .concat(links.filter((link) => !link.predicate && link.evidence !== "declared"))
+    .slice(0, 100);
+  for (const link of candidateLinks) {
+    if (link.predicate) continue;
+    const fromInfo = infos.find((x) => x.d.id === link.fromDatasetId),
+      toInfo = infos.find((x) => x.d.id === link.toDatasetId);
+    if (!fromInfo || !toInfo) continue;
+    const candidates: NonNullable<SuggestedLink["predicateCandidates"]> = [];
+    for (const side of ["from", "to"] as const) {
+      const info = side === "from" ? fromInfo : toInfo;
+      const datasetId = info.d.id;
+      const candidateColumns = info.columns
+        .filter((c) => scopeNames.test(c.name) && textType(c.type))
+        .sort((a, b) => Number(!/^(SPRAS|LANG|LANGU|LANGUAGE|LOCALE|OBJECTTYPE)$/i.test(a.name)) - Number(!/^(SPRAS|LANG|LANGU|LANGUAGE|LOCALE|OBJECTTYPE)$/i.test(b.name)));
+      for (const column of candidateColumns.slice(0, 2)) {
+        try {
+          const table = q(datasetTable(datasetId)), col = q(column.name);
+          const listed = await queryDatasets(store, scope, [datasetId],
+            `SELECT CAST(${col} AS VARCHAR) AS value, count(*) AS candidateRows FROM ${table} WHERE ${col} IS NOT NULL GROUP BY ${col} ORDER BY candidateRows DESC, value LIMIT 16`,
+            { persist: false, limit: 16 });
+          const values = listed.rows.filter((r: any) => typeof r.value === "string");
+          if (!values.length) continue;
+          const valueCte = values.map((r: any) => `(${lit(r.value)}, ${Number(r.candidateRows)})`).join(",");
+          const fromTable = q(datasetTable(link.fromDatasetId)), toTable = q(datasetTable(link.toDatasetId));
+          const on = relationshipJoinCondition(link, fromInfo.columns, toInfo.columns);
+          const matchSide = side === "from" ? `a.${col}=c.value` : `b.${col}=c.value`;
+          const sql = `WITH a AS (SELECT row_number() OVER () AS "__meridian_source_row", * FROM ${fromTable}), b AS (SELECT * FROM ${toTable}), c(value,candidateRows) AS (VALUES ${valueCte}), m AS (SELECT c.value, count(DISTINCT a."__meridian_source_row") AS matchedSourceRows, count(*) AS joinPairs FROM a JOIN b ON ${on} JOIN c ON ${matchSide} GROUP BY c.value), ac AS (SELECT count(*) AS n FROM a) SELECT c.value, c.candidateRows, coalesce(m.matchedSourceRows,0) AS matchedSourceRows, ${side === "from" ? "c.candidateRows" : "ac.n"} AS eligibleSourceRows, coalesce(m.joinPairs,0) AS joinPairs FROM c LEFT JOIN m ON c.value=m.value CROSS JOIN ac ORDER BY c.candidateRows DESC, c.value`;
+          const measured = await queryDatasets(store, scope, [link.fromDatasetId, link.toDatasetId], sql, { persist: false, limit: 16 });
+          candidates.push({ side, column: column.name, values: measured.rows.map((r: any) => ({
+            value: String(r.value), candidateRows: Number(r.candidateRows), matchedSourceRows: Number(r.matchedSourceRows),
+            eligibleSourceRows: Number(r.eligibleSourceRows), joinPairs: Number(r.joinPairs),
+          })) });
+        } catch {
+          // A candidate probe failure removes only that review option; it never
+          // changes the unscoped relationship or turns an estimate into fact.
+        }
+      }
+    }
+    if (candidates.length) link.predicateCandidates = candidates;
+  }
+
   const hash = digest(
     JSON.stringify({
+      discoveryRevision: ONTOLOGY_DISCOVERY_REVISION,
       entities: entities.map((e) => [
         e.id,
         e.kind,
@@ -825,12 +940,18 @@ export async function suggestOntology(
         l.fromColumn,
         l.toDatasetId,
         l.toColumn,
+        [...[{ fromColumn: l.fromColumn, toColumn: l.toColumn }, ...(l.additionalJoinPairs || [])]].sort((a, b) => a.fromColumn.localeCompare(b.fromColumn) || a.toColumn.localeCompare(b.toColumn)),
+        l.predicate || null,
+        l.predicateBasis || null,
+        l.predicateCandidates || [],
         l.caseInsensitive,
+        l.matchBasis,
       ]),
     }),
   );
   return {
     signature: input.signature,
+    discoveryRevision: ONTOLOGY_DISCOVERY_REVISION,
     hash,
     summary,
     described: false,

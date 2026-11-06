@@ -1,12 +1,13 @@
 import {
   BundleSchema,
-  CatalogSchema,
+  CatalogImportSchema,
   DashboardSchema,
   OntologySchema,
   OutcomeRecommendationsSchema,
   PipelineSchema,
   RelationshipSchema,
   type Resource,
+  type ValidationOmission,
   SuggestedOntologySchema,
   datasetTable,
 } from "../../../../packages/shared/src/index.js";
@@ -19,7 +20,11 @@ import { assert, digest, redact } from "../security.js";
 import { Provider } from "../providers.js";
 import { execute } from "../executor.js";
 import { pipelineId } from "../datasets.js";
-import { ontologyBundle, overviewDashboard } from "../discovery.js";
+import {
+  ontologyBundle,
+  overviewDashboard,
+  ONTOLOGY_DISCOVERY_REVISION,
+} from "../discovery.js";
 import { indexCatalog, normTable } from "../catalog-match.js";
 import {
   METRICS_PROMPT,
@@ -35,11 +40,7 @@ import {
   stratifyDatasets,
   validateSpecs,
 } from "../metrics.js";
-import {
-  assistantResource,
-  focusDatasets,
-  threadOf,
-} from "./context.js";
+import { assistantResource, focusDatasets, threadOf } from "./context.js";
 import {
   applyPartitionPrune,
   datasetsMap,
@@ -49,6 +50,7 @@ import {
 } from "./provider.js";
 import { validateBundle } from "./validate.js";
 import { assumptionsWithDroppedWidgets } from "./widget-warnings.js";
+import { omittedDefinitions } from "./omission-reasons.js";
 import { event, publishProposal } from "./proposals.js";
 
 export async function enqueue(
@@ -198,7 +200,8 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
   // Partitioned datasets expose their partition column + values so the
   // model can prune to the partitions a scoped question needs; reading
   // every partition stays the safe default when it names none.
-  const partitionInfo: Record<string, { column: string; values: string[] }> = {};
+  const partitionInfo: Record<string, { column: string; values: string[] }> =
+    {};
   await Promise.all(
     focal.map(async (d) => {
       const v = await store.get(scope, d.data.activeVersion as string);
@@ -290,8 +293,7 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
       }
       return sum;
     };
-    const today =
-      (await todayTokens("run")) + (await todayTokens("job"));
+    const today = (await todayTokens("run")) + (await todayTokens("job"));
     assert(
       today < settings.dailyTokens,
       "Workspace daily token budget exhausted",
@@ -755,6 +757,7 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
         ?.ontologySuggestion;
       assert(
         stored?.signature === run.data.onboardingSignature &&
+          stored.discoveryRevision === ONTOLOGY_DISCOVERY_REVISION &&
           stored.hash === run.data.ontologyHash,
         "The suggested ontology changed. Review it again.",
         409,
@@ -782,9 +785,7 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
               rows: m.rows,
               matched: m.matched,
             })),
-          ...(e.members.length > 6
-            ? { memberCount: e.members.length }
-            : {}),
+          ...(e.members.length > 6 ? { memberCount: e.members.length } : {}),
           properties: e.properties.slice(0, 8),
         })),
         links: s.links.map((l) => ({
@@ -793,7 +794,8 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
           to: entityName.get(l.to),
           column: l.fromColumn,
           name: l.name,
-          matchedRows: l.matchedRows,
+          matchBasis: l.matchBasis || "unverified",
+          matchedRows: l.matchBasis === "measured" ? l.matchedRows : undefined,
           totalRows: l.totalRows,
         })),
         notes: s.notes.map((n) => n.text),
@@ -807,13 +809,16 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
       try {
         const stored = await store.get(scope, "catalog");
         if (stored) {
-          const parsed = CatalogSchema.safeParse(stored.data);
+          const parsed = CatalogImportSchema.safeParse(stored.data);
           if (parsed.success) {
             const index = indexCatalog(parsed.data);
             const anchorTable = (id: string) => {
               const e = s.entities.find((x) => x.id === id);
               const ds = datasets.find((d) => d.id === e?.anchorDatasetId);
-              return ds ? (index.get(normTable(ds.name)) || index.get(normTable(e?.name || ""))) : undefined;
+              return ds
+                ? index.get(normTable(ds.name)) ||
+                    index.get(normTable(e?.name || ""))
+                : undefined;
             };
             for (const e of s.entities) {
               const def = anchorTable(e.id)?.definition?.trim();
@@ -878,28 +883,35 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
           try {
             chunk = await ask(
               `describe_ontology_${i / 10}`,
-            first
-              ? z.object({
-                  summary: z.string().default(""),
-                  entities: z
-                    .array(z.object({ id: z.string(), description: z.string() }))
-                    .default([]),
-                  links: z
-                    .array(z.object({ id: z.string(), name: z.string() }))
-                    .default([]),
-                })
-              : z.object({
-                  entities: z
-                    .array(z.object({ id: z.string(), description: z.string() }))
-                    .default([]),
-                }),
-            prompt,
+              first
+                ? z.object({
+                    summary: z.string().default(""),
+                    entities: z
+                      .array(
+                        z.object({ id: z.string(), description: z.string() }),
+                      )
+                      .default([]),
+                    links: z
+                      .array(z.object({ id: z.string(), name: z.string() }))
+                      .default([]),
+                  })
+                : z.object({
+                    entities: z
+                      .array(
+                        z.object({ id: z.string(), description: z.string() }),
+                      )
+                      .default([]),
+                  }),
+              prompt,
             );
           } catch (error) {
             // A single batch failing fails the run (loud, retryable); with
             // several batches the failed slice is skipped and the rest land.
             if (gapEntities.length <= 10) throw error;
-            console.warn(`[assistant] describe batch ${i / 10} skipped:`, error instanceof Error ? error.message : error);
+            console.warn(
+              `[assistant] describe batch ${i / 10} skipped:`,
+              error instanceof Error ? error.message : error,
+            );
           }
           if (!chunk) continue;
           if (first) {
@@ -975,6 +987,7 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
         ?.ontologySuggestion;
       assert(
         stored?.signature === run.data.onboardingSignature &&
+          stored.discoveryRevision === ONTOLOGY_DISCOVERY_REVISION &&
           stored.hash === run.data.ontologyHash,
         "The suggested ontology changed. Review it again.",
         409,
@@ -983,7 +996,7 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
       const defs = new Map<string, string>();
       try {
         const cat = await store.get(scope, "catalog");
-        const parsed = CatalogSchema.safeParse(cat?.data);
+        const parsed = CatalogImportSchema.safeParse(cat?.data);
         if (parsed.success) {
           const index = indexCatalog(parsed.data);
           const dsById = new Map(datasets.map((d) => [d.id, d]));
@@ -1004,9 +1017,7 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
       );
       const clip = (v: string, n: number) =>
         v.replace(/\s+/g, " ").trim().slice(0, n);
-      const byId = new Map<string, any>(
-        s.entities.map((e) => [e.id, e]),
-      );
+      const byId = new Map<string, any>(s.entities.map((e) => [e.id, e]));
       const slugIds = new Set(slugs.map((e) => e.id));
       let proposed = 0;
       for (let i = 0; i < slugs.length; i += 10) {
@@ -1041,8 +1052,12 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
           const got = (res as any).names;
           if (Array.isArray(got))
             for (const n of got) {
-              if (!n || typeof n.id !== "string" || !slugIds.has(n.id)) continue;
-              const clean = clip(String(n.name || ""), 60).replace(/[.:;,]+$/, "");
+              if (!n || typeof n.id !== "string" || !slugIds.has(n.id))
+                continue;
+              const clean = clip(String(n.name || ""), 60).replace(
+                /[.:;,]+$/,
+                "",
+              );
               if (clean) batch[n.id] = clean;
             }
           if (Object.keys(batch).length) {
@@ -1059,7 +1074,10 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
                   ...m,
                   ontologySuggestion: {
                     ...current,
-                    nameProposals: { ...(current.nameProposals || {}), ...batch },
+                    nameProposals: {
+                      ...(current.nameProposals || {}),
+                      ...batch,
+                    },
                   },
                 },
               });
@@ -1069,9 +1087,16 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
           // A failed batch only skips its proposals; the rest stand.
         }
       }
-      await event(store, scope, id, "complete", `Proposed ${proposed} business names`, {
-        status: "succeeded",
-      });
+      await event(
+        store,
+        scope,
+        id,
+        "complete",
+        `Proposed ${proposed} business names`,
+        {
+          status: "succeeded",
+        },
+      );
       return;
     }
     if (run.data.task === "recommend_outcomes") {
@@ -1145,7 +1170,28 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
         ? SuggestedOntologySchema.parse(run.data.ontology)
         : undefined;
     const selected = new Map(datasets.map((d) => [d.id, d]));
-    const plan = confirmed && ontologyBundle(confirmed, selected);
+    const selectedRows = datasets.reduce(
+      (sum, d) => sum + (d.data.profile?.rows || 0),
+      0,
+    );
+    const largeScale =
+      selectedRows > 1_000_000 ||
+      (confirmed?.entities.length || 0) > 20 ||
+      (confirmed?.links.length || 0) > 30;
+    const plan =
+      confirmed &&
+      ontologyBundle(confirmed, selected, {
+        materializeMerges: !largeScale,
+      });
+    const validationOptions = plan
+      ? {
+          allowDatasetRebinding: false,
+          allowedDatasetIds: run.data.datasetIds || datasets.map((d) => d.id),
+          ...(plan.relationshipEvidence.size
+            ? { relationshipEvidence: plan.relationshipEvidence }
+            : {}),
+        }
+      : { allowDatasetRebinding: true };
     if (plan)
       await event(
         store,
@@ -1186,7 +1232,12 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
         );
     context.ontology = ontologyResult;
     const dashboards = confirmed
-      ? { dashboards: [overviewDashboard(confirmed, selected)], actions: [] }
+      ? {
+          dashboards: [
+            overviewDashboard(confirmed, selected, { compact: largeScale }),
+          ],
+          actions: [],
+        }
       : await ask(
           "dashboards",
           z.object({
@@ -1211,20 +1262,25 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
       "validation",
       "Executing generated SQL and validating identities and relationships",
     );
-    let report = await validateBundle(store, scope, bundle);
-    const failed = (prefix: string) =>
+    let report = await validateBundle(store, scope, bundle, validationOptions);
+    const omissions: ValidationOmission[] = [];
+    // Read failures from the report passed in, not a captured report: the
+    // second pruning loop revalidates after every pass, so a stale set would
+    // prune actions that already pass and keep ones that now fail.
+    const failed = (rpt: typeof report, prefix: string) =>
       new Set(
-        report.checks
+        rpt.checks
           .filter((c) => !c.passed && c.name.startsWith(prefix))
           .map((c) => c.name.slice(prefix.length)),
       );
     if (plan) {
       // Confirmed definitions are not rewritten by the model; a pipeline, type or
       // relationship that fails validation is left out instead.
-      const pipes = failed("Pipeline: "),
-        types = failed("Ontology: "),
-        relations = failed("Relationship: ");
+      const pipes = failed(report, "Pipeline: "),
+        types = failed(report, "Ontology: "),
+        relations = failed(report, "Relationship: ");
       if (pipes.size || types.size || relations.size) {
+        const beforePruning = bundle;
         bundle = BundleSchema.parse({
           ...bundle,
           pipelines: bundle.pipelines.filter((p) => !pipes.has(p.name)),
@@ -1237,7 +1293,19 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
           ),
           actions: bundle.actions.filter((a) => !types.has(a.objectType)),
         });
-        report = await validateBundle(store, scope, bundle);
+        omissions.push(...omittedDefinitions(beforePruning, bundle, report));
+        await event(
+          store,
+          scope,
+          id,
+          "validation",
+          `Recorded reasons for ${omissions.length} omitted definitions`,
+          {
+            partialBundle: bundle,
+            validation: { ...report, omissions: [...omissions] },
+          },
+        );
+        report = await validateBundle(store, scope, bundle, validationOptions);
       }
     }
     const repairGroups = [
@@ -1320,14 +1388,14 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
           ontology: bundle.ontology,
           relationships: bundle.relationships,
         };
-        report = await validateBundle(store, scope, bundle);
+        report = await validateBundle(store, scope, bundle, validationOptions);
       }
     }
     if (confirmed)
       // Nobody reviews this build: widgets and actions that still fail are left
       // out, and a dashboard left without widgets becomes a computed overview.
       for (let pass = 0; pass < 2 && !report.valid; pass++) {
-        const actions = failed("Action: ");
+        const actions = failed(report, "Action: ");
         const pruned = BundleSchema.parse({
           ...bundle,
           assumptions: assumptionsWithDroppedWidgets(
@@ -1345,10 +1413,14 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
           actions: bundle.actions.filter((a) => !actions.has(a.name)),
         });
         if (JSON.stringify(pruned) === JSON.stringify(bundle)) break;
+        omissions.push(...omittedDefinitions(bundle, pruned, report));
         bundle = pruned;
-        report = await validateBundle(store, scope, bundle);
+        report = await validateBundle(store, scope, bundle, validationOptions);
       }
     delete context.repair;
+    // An explicit empty list distinguishes a recorded no-pruning result from
+    // legacy publications that did not preserve omission history at all.
+    if (confirmed) report = { ...report, omissions };
     await event(store, scope, id, "validation", "Validation report saved", {
       partialBundle: bundle,
       validation: report,
@@ -1368,6 +1440,11 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
           ...bundle.catalog.map((c) => c.datasetId),
           ...bundle.pipelines.flatMap((p) => p.inputs),
           ...bundle.ontology.map((o) => o.datasetId),
+          ...bundle.relationships.flatMap((r) =>
+            [r.fromDatasetId, r.toDatasetId].filter(
+              (datasetId): datasetId is string => !!datasetId,
+            ),
+          ),
           ...bundle.dashboards.flatMap((d) =>
             d.widgets.flatMap((w) => w.inputs),
           ),
@@ -1388,6 +1465,7 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
         resource(scope, "proposal", bundle.summary.slice(0, 90), {
           bundle,
           validation: report,
+          publicationMode: confirmed && largeScale ? "schema-only" : "records",
           status: report.valid ? "ready" : "draft",
           hash: proposalHash(bundle, report),
           parentId: run.data.parentId,
@@ -1409,12 +1487,6 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
       // Per-page full-table materialization makes row staging O(table) per
       // page: beyond this bound onboarding publishes dashboard-only and the
       // workspace queries live data instead of staged copies.
-      const stagedRows = bundle.ontology.reduce(
-        (n, o) =>
-          n +
-          (datasets.find((d) => d.id === o.datasetId)?.data.profile.rows || 0),
-        0,
-      );
       await publishProposal(
         store,
         scope,
@@ -1422,7 +1494,7 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
         proposal.data.hash,
         run.data.authority?.userId,
         "Workspace published",
-        { stageRecords: stagedRows <= 1_000_000 },
+        { stageRecords: !largeScale },
       );
       return;
     }

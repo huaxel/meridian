@@ -12,12 +12,14 @@ import {
   confirmOntology,
   entityName,
   ontologyBundle,
+  overviewDashboard,
   suggestOntology,
 } from "../apps/api/src/discovery.js";
 import { pipelineId, validateBundle } from "../apps/api/src/assistant.js";
 import { config } from "../apps/api/src/config.js";
 import {
   BundleSchema,
+  datasetTable,
   SuggestedOntologySchema,
   type SuggestedOntology,
 } from "../packages/shared/src/index.js";
@@ -107,6 +109,7 @@ const link = (from: string, column: string, to: string) =>
 
 it("consolidates the Loopwell sample into federated entities", () => {
   expect(SuggestedOntologySchema.parse(suggestion)).toEqual(suggestion);
+  expect(suggestion.links.every((l) => l.matchBasis === "measured")).toBe(true);
   expect(suggestion.entities.map((e) => [e.name, e.kind])).toEqual([
     ["Account", "record"],
     ["User", "record"],
@@ -267,12 +270,226 @@ it("builds valid pipelines, types and relationships from the suggestion", async 
   expect(bundle.ontology.find((t) => t.name === "Customer")?.datasetId).toBe(
     customer.datasetId,
   );
+  for (const relationship of plan.relationships)
+    expect(report.previews["relation:" + relationship.name]).toMatchObject({
+      matchBasis: "measured",
+    });
   const rel = (from: string, to: string) =>
     (report.previews["relation:" + between(from, to)[0].name] as any).rows[0];
   expect(Number(rel("Support ticket", "User").matched)).toBe(114);
   expect(Number(rel("Customer", "Campaign").matched)).toBe(47);
   expect(Number(rel("Subscription", "Customer").matched)).toBe(46);
   expect(Number(rel("SSO connection", "Customer").matched)).toBe(6);
+});
+
+it("builds and validates the full Local ontology without materializing large merges", async () => {
+  const scaleScope = `${scope}_full_local`;
+  scopes.push(scaleScope);
+  await workspace(scaleScope);
+  const datasets = Array.from({ length: 714 }, (_, i) => {
+    const id = `local_${i}`;
+    return resource(
+      scaleScope,
+      "dataset",
+      `Local table ${i}`,
+      {
+        activeVersion: `version_${i}`,
+        profile: {
+          rows: 100,
+          columns: [
+            {
+              name: "id",
+              type: "INTEGER",
+              nulls: 0,
+              distinct: 100,
+              examples: [],
+              sensitive: false,
+              primaryKey: true,
+            },
+            {
+              name: "parent_id",
+              type: "INTEGER",
+              nulls: 0,
+              distinct: 100,
+              examples: [],
+              sensitive: false,
+              primaryKey: false,
+            },
+          ],
+          sample: [],
+          fingerprint: `fingerprint_${i}`,
+        },
+        table: datasetTable(id),
+      },
+      id,
+    );
+  });
+  await transaction(store, scaleScope, async (tx) =>
+    datasets.forEach((d) => tx.put(d)),
+  );
+  const entity = (i: number) => ({
+    id: `entity_${i}`,
+    name: `Entity ${i}`,
+    description: `Entity ${i} description`,
+    kind: "record" as const,
+    anchorDatasetId: datasets[i].id,
+    key: "id",
+    rows: 100,
+    members: [
+      {
+        datasetId: datasets[i].id,
+        datasetName: datasets[i].name,
+        source: "Local",
+        key: "id",
+        rows: 100,
+        matched: 100,
+        via: null,
+      },
+      ...(i < 60
+        ? [
+            {
+              datasetId: datasets[431 + i].id,
+              datasetName: datasets[431 + i].name,
+              source: "Local",
+              key: "id",
+              rows: 100,
+              matched: 100,
+              via: null,
+            },
+          ]
+        : []),
+    ],
+    properties: ["id", "parent_id"],
+  });
+  const entities = Array.from({ length: 431 }, (_, i) => entity(i));
+  const links = Array.from({ length: 254 }, (_, i) => ({
+    id: `link_${i}`,
+    name: `references ${i}`,
+    from: `entity_${i}`,
+    to: `entity_${i + 1}`,
+    fromDatasetId: datasets[i].id,
+    fromColumn: "parent_id",
+    toDatasetId: datasets[i + 1].id,
+    toColumn: "id",
+    totalRows: 100,
+    matchedRows: 95,
+    caseInsensitive: false,
+    evidence: "declared" as const,
+  }));
+  const suggestion: SuggestedOntology = {
+    signature: "signature",
+    hash: "hash",
+    summary: "The full Local data model",
+    described: true,
+    entities,
+    links,
+    notes: [],
+    unplaced: datasets.slice(491).map((d) => d.id),
+  };
+  const plan = ontologyBundle(
+    suggestion,
+    new Map(datasets.map((d) => [d.id, d])),
+    { materializeMerges: false },
+  );
+  expect(plan.ontology).toHaveLength(431);
+  expect(plan.relationships).toHaveLength(254);
+  expect(plan.pipelines).toHaveLength(0);
+  expect(plan.catalog).toHaveLength(714);
+  expect(plan.relationshipEvidence.size).toBe(254);
+  expect(plan.relationships[0]).toMatchObject({
+    fromDatasetId: datasets[0].id,
+    toDatasetId: datasets[1].id,
+    fromColumn: "parent_id",
+    toColumn: "id",
+  });
+  const bundle = BundleSchema.parse({ ...plan, dashboards: [], actions: [] });
+  const compactOverview = overviewDashboard(
+    suggestion,
+    new Map(datasets.map((d) => [d.id, d])),
+    { compact: true },
+  );
+  expect(compactOverview.widgets).toHaveLength(1);
+  expect(compactOverview.widgets[0].inputs).toHaveLength(1);
+  expect(compactOverview.widgets[0].sql).not.toContain("UNION ALL");
+  const report = await validateBundle(store, scaleScope, bundle, {
+    relationshipEvidence: plan.relationshipEvidence,
+  });
+  expect(report.valid).toBe(true);
+  expect(report.checks).toHaveLength(1 + 1 + 431 + 254 + 714);
+  expect(report.previews["relation:references 0"]).toMatchObject({
+    rows: [{ total: 100, matched: 95 }],
+    evidence: "declared",
+  });
+});
+
+it.each([[false, false], [true, false], [false, true], [true, true]])("keeps schema repair opt-in and source-scoped (alternative selected: %s, draft repair: %s)", async (alternativeSelected, allowDatasetRebinding) => {
+  const selectedScope = `${scope}_selected_scope_${alternativeSelected}_${allowDatasetRebinding}`;
+  scopes.push(selectedScope);
+  await workspace(selectedScope);
+  const profile = (primaryKey: boolean) => ({
+    rows: 3,
+    columns: [
+      {
+        name: "id",
+        type: "INTEGER",
+        nulls: 0,
+        distinct: 3,
+        examples: [],
+        sensitive: false,
+        primaryKey,
+      },
+    ],
+    sample: [],
+    fingerprint: primaryKey ? "valid-key" : "provisional-key",
+  });
+  const selected = resource(
+    selectedScope,
+    "dataset",
+    "Selected table",
+    { activeVersion: "v1", profile: profile(false) },
+    "selected",
+  );
+  const unselected = resource(
+    selectedScope,
+    "dataset",
+    "Unselected duplicate",
+    { activeVersion: "v1", profile: profile(true) },
+    "unselected",
+  );
+  await transaction(store, selectedScope, async (tx) => {
+    tx.put(selected);
+    tx.put(unselected);
+  });
+  const bundle = BundleSchema.parse({
+    summary: "Selected source",
+    assumptions: [],
+    catalog: [],
+    pipelines: [],
+    ontology: [
+      {
+        name: "Selected entity",
+        datasetId: selected.id,
+        primaryKey: "id",
+        properties: ["id"],
+      },
+    ],
+    relationships: [],
+    dashboards: [],
+    actions: [],
+  });
+  const report = await validateBundle(store, selectedScope, bundle, {
+    allowedDatasetIds: [selected.id, ...(alternativeSelected ? [unselected.id] : [])],
+    allowDatasetRebinding,
+  });
+  if (allowDatasetRebinding && alternativeSelected) {
+    expect(bundle.ontology[0].datasetId).toBe(unselected.id);
+    expect(report.valid).toBe(true);
+    return;
+  }
+  expect(bundle.ontology[0].datasetId).toBe(selected.id);
+  expect(
+    report.checks.find((c) => c.name === "Ontology: Selected entity"),
+  ).toMatchObject({ passed: false, detail: "Primary key must be unique and non-null" });
 });
 
 it("drops notes about excluded entities and recounts the summary", () => {

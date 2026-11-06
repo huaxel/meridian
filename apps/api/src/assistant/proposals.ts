@@ -11,8 +11,11 @@ import { assert, digest } from "../security.js";
 import { execute } from "../executor.js";
 import { pipelineId } from "../datasets.js";
 import { randomUUID } from "node:crypto";
+import { relationshipJoinCondition } from "../relationship-sql.js";
 import { datasetsMap, inputsFor, proposalHash } from "./provider.js";
 import { validateBundle } from "./validate.js";
+import { publicationReview } from "./publication-mode.js";
+import { assertMountedSourceCurrent } from "./source-freshness.js";
 
 export async function saveProposal(
   store: Store,
@@ -20,27 +23,49 @@ export async function saveProposal(
   bundle: Bundle,
   parentId?: string,
 ) {
-  const report = await validateBundle(store, scope, bundle);
+  const previous = parentId ? await store.get(scope, parentId) : undefined;
+  const review = await publicationReview(store, scope, previous, bundle);
+  const report = await validateBundle(store, scope, bundle, {
+    ...(review.mode === "schema-only" ? {
+      relationshipEvidence: review.relationshipEvidence,
+      requireRelationshipEvidence: true,
+    } : {}),
+  });
   return transaction(store, scope, async (tx) => {
     const parent = parentId ? await tx.get(parentId) : undefined;
+    assert(
+      !previous || (parent?.data.hash === previous.data.hash &&
+        parent?.data.publicationMode === previous.data.publicationMode),
+      "Parent proposal changed during validation. Retry.",
+      409,
+    );
+    // Setup ownership is a guard on unfinished setup work, not permanent
+    // ownership of every later revision of an already-published workspace.
+    const onboarding =
+      parent?.data.status !== "published" && parent?.data.onboardingSignature
+        ? {
+            onboardingSignature: parent.data.onboardingSignature,
+            onboardingRunId: parent.data.onboardingRunId,
+          }
+        : undefined;
     const p = tx.put(
       resource(scope, "proposal", bundle.summary.slice(0, 90), {
         bundle,
         validation: report,
+        publicationMode: review.mode,
         status: report.valid ? "ready" : "draft",
         hash: proposalHash(bundle, report),
         parentId,
-        ...(parent?.data.onboardingSignature
-          ? {
-              onboardingSignature: parent.data.onboardingSignature,
-              onboardingRunId: parent.data.onboardingRunId,
-            }
-          : {}),
+        ...onboarding,
       }),
     );
-    if (parent?.data.onboardingRunId) {
-      const run = await tx.get(parent.data.onboardingRunId);
-      if (run && run.data.proposalId === parentId)
+    if (onboarding?.onboardingRunId) {
+      const run = await tx.get(onboarding.onboardingRunId);
+      if (
+        run &&
+        run.data.status !== "succeeded" &&
+        run.data.proposalId === parentId
+      )
         tx.update(run, { ...run.data, proposalId: p.id });
     }
     return p;
@@ -100,12 +125,41 @@ export async function publishProposal(
   );
   const report = proposal.data.validation as ValidationReport,
     bundle = BundleSchema.parse(proposal.data.bundle);
-  for (const [datasetId, version] of Object.entries(report.inputVersions))
+  const review = await publicationReview(store, scope, proposal, bundle);
+  assert(
+    review.mode !== "schema-only" || opts.stageRecords !== true,
+    "Schema-only proposals cannot stage records without member-to-anchor identity mapping.",
+  );
+  const stageRecords = opts.stageRecords ?? (review.mode !== "schema-only");
+  if (review.mode === "schema-only")
     assert(
-      (await store.get(scope, datasetId))?.data.activeVersion === version,
+      bundle.relationships.every(r => review.relationshipEvidence.has(r.name)),
+      "Saved relationship evidence changed or is unavailable. Revalidate or rebuild this proposal.",
+      409,
+    );
+  if (stageRecords) {
+    const types = new Map(bundle.ontology.map((t) => [t.name, t]));
+    for (const rel of bundle.relationships) {
+      const from = types.get(rel.fromType),
+        to = types.get(rel.toType);
+      assert(
+        from &&
+          to &&
+          (!rel.fromDatasetId || rel.fromDatasetId === from.datasetId) &&
+          (!rel.toDatasetId || rel.toDatasetId === to.datasetId),
+        "Source-member relationships cannot stage record edges without member-to-anchor identity mapping. Publish schema-only or materialize the entity mapping first.",
+      );
+    }
+  }
+  for (const [datasetId, version] of Object.entries(report.inputVersions)) {
+    const dataset = await store.get(scope, datasetId);
+    assert(
+      dataset?.data.activeVersion === version,
       "Input data changed. Revalidate this proposal.",
       409,
     );
+    await assertMountedSourceCurrent(store, scope, dataset);
+  }
   const beforeGeneration = (await store.get(scope, "workspace"))?.data
     .activeGeneration;
   assert(
@@ -174,7 +228,6 @@ export async function publishProposal(
   // Row staging pages every record 500 at a time, and the executor
   // materializes the full table per page: at scale that never finishes, so
   // huge workspaces publish dashboard-only and query live instead.
-  const stageRecords = opts.stageRecords !== false;
   for (const type of bundle.ontology) {
     const dataset = map.get(type.datasetId);
     assert(dataset, "Dataset unavailable");
@@ -221,6 +274,19 @@ export async function publishProposal(
       });
     }
   }
+  // Analytical sources are published as schema metadata only. Never stage rows,
+  // assign logical IDs, or create graph endpoints for them.
+  for (const source of bundle.analyticalSources) {
+    const dataset = map.get(source.datasetId);
+    assert(dataset, "Analytical source dataset unavailable");
+    assets.push(
+      resource(scope, "analyticalSource", source.name, {
+        ...source,
+        activeVersion: dataset.data.activeVersion,
+        generation,
+      }),
+    );
+  }
   for (const o of manualObjects) {
     const lookup = identities.get(o.data.type);
     if (lookup && !lookup.has(o.data.key)) {
@@ -241,8 +307,11 @@ export async function publishProposal(
     // itself would scan both tables for nothing.
     if (!stageRecords) continue;
     const fromType = bundle.ontology.find((o) => o.name === rel.fromType)!,
-      toType = bundle.ontology.find((o) => o.name === rel.toType)!;
-    const sql = `SELECT a.${quote(fromType.primaryKey)} AS from_key,b.${quote(toType.primaryKey)} AS to_key FROM ${quote(datasetTable(fromType.datasetId))} a JOIN ${quote(datasetTable(toType.datasetId))} b ON a.${quote(rel.fromColumn)}=b.${quote(rel.toColumn)}`;
+      toType = bundle.ontology.find((o) => o.name === rel.toType)!,
+      fromDataset = map.get(fromType.datasetId)!,
+      toDataset = map.get(toType.datasetId)!,
+      on = relationshipJoinCondition(rel, fromDataset.data.profile.columns, toDataset.data.profile.columns);
+    const sql = `SELECT a.${quote(fromType.primaryKey)} AS from_key,b.${quote(toType.primaryKey)} AS to_key FROM ${quote(datasetTable(fromType.datasetId))} a JOIN ${quote(datasetTable(toType.datasetId))} b ON ${on}`;
     let offset = 0,
       total = Infinity;
     while (offset < total) {
@@ -335,12 +404,22 @@ export async function publishProposal(
       "Proposal changed during publication",
       409,
     );
-    for (const [datasetId, v] of Object.entries(report.inputVersions))
+    assert(
+      p.data.publicationMode === proposal.data.publicationMode,
+      "Publication mode changed during publication",
+      409,
+    );
+    for (const [datasetId, v] of Object.entries(report.inputVersions)) {
+      const dataset = await tx.get(datasetId);
       assert(
-        (await tx.get(datasetId))?.data.activeVersion === v,
+        dataset?.data.activeVersion === v,
         "Inputs changed during publication",
         409,
       );
+      // The external file can change without activeVersion changing. Never
+      // reuse the validation/start-of-publication stat at activation time.
+      await assertMountedSourceCurrent(store, scope, dataset);
+    }
     const workspace = await tx.get("workspace");
     assert(workspace, "Workspace missing");
     await assertOnboardingPublication(tx, p);
@@ -378,15 +457,17 @@ export async function publishProposal(
         previousGeneration: workspace.data.activeGeneration || null,
         proposalId: id,
         actor,
+        publicationMode: stageRecords ? "records" : "schema-only",
       }),
     );
-    for (const run of await tx.list("run"))
+    for (const run of await tx.list("run")) {
       if (
         run.data.proposalId &&
         run.data.status !== "canceled" &&
+        run.data.status !== "succeeded" &&
         [id, p.data.parentId].includes(run.data.proposalId)
-      )
-        tx.update(run, {
+      ) {
+        const completed: Record<string, any> = {
           ...run.data,
           status: "succeeded",
           stage: "published",
@@ -399,7 +480,19 @@ export async function publishProposal(
               message,
             },
           ],
-        });
+        };
+        if (run.data.task === "onboarding_build") {
+          // The proposal now holds the validated bundle. Remove build-time
+          // checkpoints so completion fits atomically with generation activation.
+          delete completed.ontology;
+          delete completed.context;
+          delete completed.checkpoints;
+          delete completed.partialBundle;
+          delete completed.validation;
+        }
+        tx.update(run, completed);
+      }
+    }
     tx.put(
       resource(scope, "audit", "Published workspace", {
         actor,
@@ -410,6 +503,7 @@ export async function publishProposal(
     return tx.update(p, {
       ...p.data,
       status: "published",
+      publicationMode: stageRecords ? "records" : "schema-only",
       publishedGeneration: generation,
     });
   });

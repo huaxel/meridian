@@ -26,6 +26,45 @@
   margin-top: 16px;
 }
 
+/* Publication diagnostics are separate from the schema's semantic evidence. */
+.on-validation {
+  margin-bottom: 16px;
+  padding: 16px;
+  border: 1px solid var(--hf-border);
+  border-radius: var(--hf-radius);
+  background: var(--hf-surface);
+  font-size: var(--hf-text-sm);
+}
+.on-validation h2 {
+  margin: 0 0 8px;
+  font-size: var(--hf-text-sm);
+}
+.on-validation p {
+  margin: 6px 0;
+  color: var(--hf-muted);
+}
+.on-validation .on-validation-status {
+  color: var(--hf-text);
+  font-weight: 600;
+}
+.on-validation summary {
+  margin-top: 10px;
+  cursor: pointer;
+}
+.on-validation-details {
+  max-height: 24rem;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+.on-validation-details li {
+  margin: 8px 0;
+}
+.on-validation summary:focus-visible,
+.on-validation-details:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 3px;
+}
+
 /* Explorer graph */
 .og {
   display: grid;
@@ -372,6 +411,22 @@
   gap: 10px;
   color: var(--hf-muted);
   font-size: var(--hf-text-sm);
+}
+.so-scope-choice {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0;
+  max-width: 760px;
+  font-size: var(--hf-text-sm);
+}
+.so-scope-choice select {
+  min-width: 0;
+  width: 100%;
+  padding: 8px 10px;
+  color: var(--hf-text);
+  border: 1px solid var(--hf-border);
+  border-radius: var(--hf-radius-sm);
+  background: var(--hf-surface);
 }
 /* The field picker reads as its first option; its label stays for screen readers. */
 .rx-where > span {

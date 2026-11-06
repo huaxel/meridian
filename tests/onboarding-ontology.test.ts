@@ -24,6 +24,7 @@ import { sampleDatasets } from "../apps/api/src/sample-data.js";
 import { Provider } from "../apps/api/src/providers.js";
 import { config } from "../apps/api/src/config.js";
 import { recordLabel } from "../apps/api/src/routes/ontology.js";
+import { ONTOLOGY_DISCOVERY_REVISION } from "../apps/api/src/discovery/revision.js";
 import { referenceReply } from "./fixtures-reference.js";
 
 let store: MemoryStore,
@@ -138,6 +139,7 @@ it("suggests an ontology once per data version and lets the AI describe it", asy
     (await store.list(scope, "job")).filter((j) => j.data.type === "suggest"),
   ).toHaveLength(1);
   const state = await suggestNow();
+  expect(state.ontology.discoveryRevision).toBe(ONTOLOGY_DISCOVERY_REVISION);
   expect(state.ontology!.entities[0].name).toBe("Account");
   expect(state.ontology.described).toBe(false);
   // Without a ready provider the computed text stays and no run is queued.
@@ -188,6 +190,56 @@ it("suggests an ontology once per data version and lets the AI describe it", asy
   );
 });
 
+it("recomputes a cached draft from an obsolete discovery revision without changing inputs", async () => {
+  await samples();
+  const original = await suggestNow();
+  const inputIds = original.datasets.map((d) => d.id);
+  const excludedIds = original.excludedIds;
+  await transaction(store, scope, async (tx) => {
+    const workspace = (await tx.get("workspace"))!;
+    const onboarding = workspace.data.onboarding!;
+    onboarding.ontologySuggestion = {
+      ...onboarding.ontologySuggestion,
+      discoveryRevision: ONTOLOGY_DISCOVERY_REVISION - 1,
+      hash: "legacy-discovery-hash",
+    };
+    tx.update(workspace, workspace.data);
+  });
+
+  const stale = await onboardingState(store, scope);
+  expect(stale.ontology).toBeUndefined();
+  expect(stale.ontologyConfirmed).toBe(false);
+  const refused = await request("POST", "/onboarding/ontology/confirm", {
+    hash: "legacy-discovery-hash",
+  });
+  expect(refused.statusCode).toBe(409);
+
+  const queued = await request("POST", "/onboarding/ontology", {});
+  expect(queued.statusCode, queued.body).toBe(200);
+  expect(queued.json().ontology).toBeUndefined();
+  expect(queued.json().signature).toBe(original.signature);
+  expect(queued.json().datasets.map((d: any) => d.id)).toEqual(inputIds);
+  expect(queued.json().excludedIds).toEqual(excludedIds);
+  expect(queued.json().suggestJob.data.status).toBe("queued");
+
+  const job = (await store.list(scope, "job")).find(
+    (j) => j.data.type === "suggest" && j.data.status === "queued",
+  )!;
+  const { runSuggestJob } = await import("../apps/api/src/suggest-job.js");
+  await runSuggestJob(store, scope, job);
+  await transaction(store, scope, async (tx) => {
+    const current = (await tx.get(job.id))!;
+    tx.update(current, { ...current.data, status: "succeeded" });
+  });
+  const refreshed = await onboardingState(store, scope);
+  expect(refreshed.signature).toBe(original.signature);
+  expect(refreshed.ontology?.discoveryRevision).toBe(
+    ONTOLOGY_DISCOVERY_REVISION,
+  );
+  expect(refreshed.ontology?.hash).not.toBe("legacy-discovery-hash");
+  expect(refreshed.datasets.map((d) => d.id)).toEqual(inputIds);
+});
+
 it("confirms a reviewed ontology, builds a pipeline-backed view from it and publishes it", async () => {
   // No AI is set up: confirming and building from a confirmed ontology is code.
   await samples();
@@ -219,6 +271,11 @@ it("confirms a reviewed ontology, builds a pipeline-backed view from it and publ
   expect(confirmed.statusCode, confirmed.body).toBe(200);
   const state = confirmed.json();
   expect(state).toMatchObject({ step: "review", ontologyConfirmed: true });
+  const onboarding = (await store.get(scope, "workspace"))?.data.onboarding;
+  expect(onboarding?.ontology.value).toBeUndefined();
+  expect(onboarding?.ontology.suggestionHash).toBe(suggested.hash);
+  expect(onboarding?.ontologySuggestion.hash).toBe(suggested.hash);
+  expect(state.ontology.hash).toBe(suggested.hash);
   expect(state.buildRun.data.ontology.entities.map((e: any) => e.name)).toEqual(
     [
       "Customer",
@@ -261,6 +318,7 @@ it("confirms a reviewed ontology, builds a pipeline-backed view from it and publ
     p.data.validation.valid,
     JSON.stringify(p.data.validation.checks.filter((c: any) => !c.passed)),
   ).toBe(true);
+  expect(p.data.validation.omissions).toEqual([]);
   expect((await store.list(scope, "publication"))[0].data).toMatchObject({
     proposalId: p.id,
     actor,
@@ -317,6 +375,61 @@ it("confirms a reviewed ontology, builds a pipeline-backed view from it and publ
     parentId: p.id,
   });
   expect(revision.json().data.ontology.entities[0].name).toBe("Customer");
+});
+
+it("retains omitted type and dependent-link reasons in the published validation report", async () => {
+  await samples();
+  const suggested = (await suggestNow()).ontology;
+  const confirmed = await request("POST", "/onboarding/ontology/confirm", {
+    hash: suggested.hash,
+  });
+  expect(confirmed.statusCode, confirmed.body).toBe(200);
+  const runId = confirmed.json().buildRun.id;
+  await transaction(store, scope, async (tx) => {
+    const run = (await tx.get(runId))!;
+    const ontology = structuredClone(run.data.ontology);
+    const subscription = ontology.entities.find(
+      (e: any) => e.name === "Subscription",
+    );
+    expect(subscription).toBeDefined();
+    subscription.key = "missing_subscription_key";
+    tx.update(run, { ...run.data, ontology });
+  });
+  await buildWorkspace(store, scope, runId);
+  const built = await onboardingState(store, scope);
+  expect(built.complete, built.buildRun?.data.error).toBe(true);
+  const proposal = built.proposal!;
+  expect(proposal.data.validation.valid).toBe(true);
+  expect(proposal.data.validation.checks.every((c: any) => c.passed)).toBe(
+    true,
+  );
+  expect(
+    proposal.data.bundle.ontology.some((t: any) => t.name === "Subscription"),
+  ).toBe(false);
+  for (const omission of proposal.data.validation.omissions)
+    for (const reason of omission.reasons)
+      expect(reason).not.toContain("no individual failure detail was retained");
+  expect(proposal.data.validation.omissions).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        kind: "objectType",
+        name: "Subscription",
+        reasons: ["Unknown property missing_subscription_key"],
+      }),
+      expect.objectContaining({
+        kind: "relationship",
+        name: "for subscription",
+        reasons: expect.arrayContaining([
+          expect.stringContaining('Object type "Subscription" was omitted'),
+        ]),
+      }),
+    ]),
+  );
+  // Completion clears the run's bulky validation checkpoint, not the proposal evidence.
+  expect((await store.get(scope, runId))?.data.validation).toBeUndefined();
+  expect(
+    (await store.get(scope, proposal.id))?.data.validation.omissions,
+  ).toEqual(proposal.data.validation.omissions);
 });
 
 it("recomputes the suggestion when the selected data changes", async () => {

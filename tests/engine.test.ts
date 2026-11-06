@@ -214,3 +214,64 @@ describe("isolated dataset execution", () => {
     }
   });
 });
+
+it("records empty-string keys alongside uniqueness evidence without dropping the key flag", async () => {
+  await writeFile(
+    join(dir, "incoming", "a", "blanks.jsonl"),
+    [
+      { id: "", region: "EU" },
+      { id: "b", region: "US" },
+    ]
+      .map((r) => JSON.stringify(r))
+      .join("\n"),
+  );
+  const r = await execute(
+    { mode: "ingest", scope: "a", version: "blanks", file: "blanks.jsonl" },
+    dir,
+  );
+  // Warnings-only policy: the flag still holds (unique, non-null) while the
+  // blank count is recorded for validation to surface.
+  expect(r.profile.columns.find((c) => c.name === "id")).toMatchObject({
+    nulls: 0,
+    distinct: 2,
+    blanks: 1,
+    primaryKey: true,
+  });
+  // A measured zero is recorded (not left undefined): only unmeasured
+  // columns — non-text types or the memory-fallback path — omit the field.
+  expect(r.profile.columns.find((c) => c.name === "region")?.blanks).toBe(0);
+  // Non-text comparisons against '' would fail or coerce, so integer
+  // columns leave blanks unmeasured rather than reporting zero.
+  await writeFile(
+    join(dir, "incoming", "a", "ints.jsonl"),
+    [{ n: 1 }, { n: 2 }].map((r) => JSON.stringify(r)).join("\n"),
+  );
+  const ints = await execute(
+    { mode: "ingest", scope: "a", version: "ints", file: "ints.jsonl" },
+    dir,
+  );
+  expect(ints.profile.columns.find((c) => c.name === "n")).toMatchObject({
+    primaryKey: true,
+  });
+  expect(ints.profile.columns.find((c) => c.name === "n")).not.toHaveProperty(
+    "blanks",
+  );
+});
+
+it("leaves blanks unmeasured on struct columns instead of failing the import", async () => {
+  await writeFile(
+    join(dir, "incoming", "a", "structs.jsonl"),
+    [{ id: "a", meta: { code: "x" } }].map((r) => JSON.stringify(r)).join("\n"),
+  );
+  const r = await execute(
+    { mode: "ingest", scope: "a", version: "structs", file: "structs.jsonl" },
+    dir,
+  );
+  expect(r.profile.columns.find((c) => c.name === "id")).toMatchObject({
+    blanks: 0,
+    primaryKey: true,
+  });
+  expect(r.profile.columns.find((c) => c.name === "meta")).not.toHaveProperty(
+    "blanks",
+  );
+});

@@ -1,3 +1,4 @@
+import { confirmedOntologyValue } from "./discovery/confirm.js";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { createHash } from "node:crypto";
@@ -24,7 +25,12 @@ import { config } from "./config.js";
 import { discover } from "./connectors.js";
 import { providerSettings, retried } from "./assistant.js";
 import { onboardingState, publicResource } from "./onboarding-state.js";
-import { confirmOntology, ontologyGoal } from "./discovery.js";
+import {
+  confirmOntology,
+  resolvedOntologyDigest,
+  ontologyGoal,
+  ONTOLOGY_DISCOVERY_REVISION,
+} from "./discovery.js";
 
 type Access = (req: any, role?: "owner" | "editor" | "viewer") => Promise<any>;
 export function registerOnboarding(
@@ -434,9 +440,16 @@ export function registerOnboarding(
         const w = (await tx.get("workspace"))!,
           m = w.data.onboarding || {};
         // Revisions keep building from the confirmed ontology.
+        const confirmedValue = confirmedOntologyValue(m, state.signature);
+        if (kind === "build" && m.ontology)
+          assert(
+            confirmedValue,
+            "The confirmed ontology changed. Review and confirm it again.",
+            409,
+          );
         const confirmed =
-          kind === "build" && m.ontology?.signature === state.signature
-            ? m.ontology
+          kind === "build" && confirmedValue
+            ? { hash: m.ontology.hash, value: confirmedValue }
             : undefined;
         const run = await setupRun(tx, a, state, {
           kind,
@@ -463,16 +476,30 @@ export function registerOnboarding(
     const state = await onboardingState(store, a.scope);
     assert(!state.sampleProgress, "Sample data is still loading.", 409);
     assert(state.inputsReady, state.blockers.join(" "), 409);
-    const stored = (await store.get(a.scope, "workspace"))?.data.onboarding
-      ?.ontologySuggestion;
+    const onboarding = (await store.get(a.scope, "workspace"))?.data
+      .onboarding;
+    const stored =
+      onboarding?.ontologySuggestion ||
+      (onboarding?.ontology?.signature === state.signature
+        ? onboarding.ontology.value
+        : undefined);
     // The suggestion computes in a background job so this request returns fast;
     // the client polls until the fresh suggestion (or a failure) appears.
     const fresh: SuggestedOntology | undefined =
-      stored?.signature === state.signature ? stored : undefined;
+      stored?.signature === state.signature &&
+      stored.discoveryRevision === ONTOLOGY_DISCOVERY_REVISION
+        ? stored
+        : undefined;
     await transaction(store, a.scope, async (tx) => {
       const w = (await tx.get("workspace"))!,
         m = w.data.onboarding || {};
-      const current = fresh || m.ontologySuggestion;
+      const current =
+        fresh ||
+        (m.ontologySuggestion?.signature === state.signature
+          ? m.ontologySuggestion
+          : m.ontology?.signature === state.signature
+            ? m.ontology.value
+            : m.ontologySuggestion);
       if (!fresh) {
         for (const j of await tx.list("job"))
           if (
@@ -507,7 +534,7 @@ export function registerOnboarding(
         !!fresh &&
         state.providerReady &&
         !fresh.described &&
-        linked?.data.onboardingSignature !== state.signature;
+        linked?.data.ontologyHash !== fresh.hash;
       // A finished run described an earlier copy of this suggestion (the data was
       // deselected and restored since), so the next attempt gets its own run.
       let runId =
@@ -560,7 +587,16 @@ export function registerOnboarding(
     await transaction(store, a.scope, async (tx) => {
       const w = (await tx.get("workspace"))!,
         m = w.data.onboarding || {},
-        suggestion = m.ontologySuggestion;
+        candidate =
+          m.ontologySuggestion?.signature === state.signature
+            ? m.ontologySuggestion
+            : m.ontology?.signature === state.signature
+              ? m.ontology.value
+              : undefined,
+        suggestion =
+          candidate?.discoveryRevision === ONTOLOGY_DISCOVERY_REVISION
+            ? candidate
+            : undefined;
       assert(
         suggestion?.signature === state.signature &&
           suggestion.hash === body.hash,
@@ -570,25 +606,30 @@ export function registerOnboarding(
       const value = confirmOntology(suggestion, body);
       const ontology = {
         signature: state.signature,
-        hash: digest(JSON.stringify(value)),
-        value,
+        hash: resolvedOntologyDigest(value),
+        suggestionHash: suggestion.hash,
         confirmedAt: now(),
         actor: a.user.id,
+        edits: {
+          excluded: body.excluded,
+          names: body.names,
+          ...(Object.keys(body.predicates).length ? { predicates: body.predicates } : {}),
+          ...(body.analyticalSources.length ? { analyticalSources: body.analyticalSources } : {}),
+        },
       };
       const goal = ontologyGoal(value);
       const run = await setupRun(tx, a, state, {
         kind: "build",
         goal,
-        ontology,
+        ontology: { hash: ontology.hash, value },
       });
       tx.update(w, {
         ...w.data,
         onboarding: {
           ...m,
-          ontology: {
-            ...ontology,
-            edits: { excluded: body.excluded, names: body.names },
-          },
+          // Keep a compact confirmation reference. The full value remains in
+          // the suggestion and build run without a third copy in this write.
+          ontology,
           goal,
           buildRunId: run.id,
           step: "review",
