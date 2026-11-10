@@ -33,6 +33,7 @@ const launch = runnerLaunch(runnerPath, existsSync(runnerPath));
 import { createGate } from "./gate.js";
 import { sweepScratch, SCRATCH_PREFIX, SANDBOX_PREFIX } from "./scratch.js";
 import { runnerLaunch, shellQuote } from "./runner-launch.js";
+import { attachChildIo } from "./child-io.js";
 
 const concurrency = Math.max(
   1,
@@ -259,8 +260,10 @@ app.post("/execute", async (req, reply) => {
             env,
             stdio: ["pipe", "pipe", "pipe"],
           });
-      let out = "",
-        err = "";
+      const io = attachChildIo(child, {
+        maxOut: 10_000_000,
+        onOverflow: () => child.kill("SIGKILL"),
+      });
       const timer = setTimeout(
         () => child.kill("SIGKILL"),
         Number(process.env.EXECUTOR_TIMEOUT_MS || 120000),
@@ -271,11 +274,6 @@ app.post("/execute", async (req, reply) => {
         if (isolatedTempDir)
           rm(isolatedTempDir, { recursive: true, force: true }).catch(() => {});
       };
-      child.stdout.on("data", (x) => {
-        out += x;
-        if (out.length > 10_000_000) child.kill("SIGKILL");
-      });
-      child.stderr.on("data", (x) => (err += x));
       child.on("error", (e) => {
         clearTimeout(timer);
         cleanup();
@@ -287,7 +285,8 @@ app.post("/execute", async (req, reply) => {
           cleanup();
           return resolve(
             reply.code(422).send({
-              error: err.slice(0, 1500) || "Query exceeded execution limits",
+              error:
+                io.err().slice(0, 1500) || "Query exceeded execution limits",
             }),
           );
         }
@@ -345,7 +344,7 @@ app.post("/execute", async (req, reply) => {
         }
         cleanup();
         try {
-          resolve(JSON.parse(out));
+          resolve(JSON.parse(io.out()));
         } catch {
           resolve(reply.code(500).send({ error: "Invalid executor response" }));
         }
