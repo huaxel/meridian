@@ -26,6 +26,25 @@ const jobHandlers: Record<
   suggest: runSuggestJob,
   validate: runValidateJob,
 };
+function failureFinding(scope: string, job: Resource, error: string) {
+  return resource(
+    scope,
+    "finding",
+    "Failed " + job.name,
+    {
+      kind: "failure",
+      jobId: job.id,
+      dismissed: false,
+      evidence: {
+        error,
+        pipelineId: job.data.pipelineId,
+        sourceId: job.data.sourceId,
+      },
+    },
+    "failure_" + job.id,
+  );
+}
+
 export function startWorker(store: Store) {
   const stopStreams = startChangeStreams(store);
   let busy = false,
@@ -109,6 +128,17 @@ export function startWorker(store: Store) {
               (r.data.status === "running" && r.data.leaseUntil > Date.now())
             )
               return false;
+            if (
+              r.kind === "job" &&
+              r.data.status === "running" &&
+              (r.data.attempts || 0) >= 3
+            ) {
+              const error =
+                "Job exceeded its retry limit after the worker was interrupted";
+              tx.update(r, { ...r.data, status: "failed", error });
+              tx.put(failureFinding(scope, r, error));
+              return false;
+            }
             tx.update(r, {
               ...r.data,
               status: "running",
@@ -129,73 +159,85 @@ export function startWorker(store: Store) {
             30000,
           );
           try {
-            if (candidate.kind === "run")
-              await buildWorkspace(store, scope, candidate.id);
-            else {
-              if (candidate.data.actor) {
-                const member = await store.get(
-                  "global",
-                  `${candidate.data.actor}:${scope}`,
-                );
-                assert(
-                  member && ["owner", "editor"].includes(member.data.role),
-                  "Import permission is no longer available",
-                  403,
-                );
-              }
-              const handler = Object.hasOwn(jobHandlers, candidate.data.type)
-                ? jobHandlers[candidate.data.type]
-                : undefined;
-              if (!handler)
-                throw new Error("Unsupported job type: " + candidate.data.type);
-              await handler(store, scope, candidate);
-              await transaction(store, scope, async (tx) => {
-                const r = await tx.get(candidate.id);
-                if (r && r.data.status !== "canceled")
-                  tx.update(r, {
-                    ...r.data,
-                    status: "succeeded",
-                    error: null,
-                    progress: { message: "Complete snapshot ready" },
-                  });
-              });
-            }
-          } catch (e) {
-            await transaction(store, scope, async (tx) => {
-              const r = await tx.get(candidate.id);
-              if (r && r.data.status !== "canceled") {
-                tx.update(r, {
-                  ...r.data,
-                  status:
-                    r.kind === "job" && (r.data.attempts || 0) < 3
-                      ? "queued"
-                      : "failed",
-                  error: e instanceof Error ? e.message : "Job failed",
-                  retryAt:
-                    Date.now() +
-                    Math.min(60000, 1000 * 2 ** (r.data.attempts || 1)),
-                });
-                if (r.kind === "job" && (r.data.attempts || 0) >= 3)
-                  tx.put(
-                    resource(
-                      scope,
-                      "finding",
-                      "Failed " + r.name,
-                      {
-                        kind: "failure",
-                        jobId: r.id,
-                        dismissed: false,
-                        evidence: {
-                          error: e instanceof Error ? e.message : "Job failed",
-                          pipelineId: r.data.pipelineId,
-                          sourceId: r.data.sourceId,
-                        },
-                      },
-                      "failure_" + r.id,
-                    ),
+            let handlerDone = false;
+            try {
+              if (candidate.kind === "run") {
+                await buildWorkspace(store, scope, candidate.id);
+                handlerDone = true;
+              } else {
+                if (candidate.data.actor) {
+                  const member = await store.get(
+                    "global",
+                    `${candidate.data.actor}:${scope}`,
                   );
+                  assert(
+                    member && ["owner", "editor"].includes(member.data.role),
+                    "Import permission is no longer available",
+                    403,
+                  );
+                }
+                const handler = Object.hasOwn(jobHandlers, candidate.data.type)
+                  ? jobHandlers[candidate.data.type]
+                  : undefined;
+                if (!handler)
+                  throw new Error("Unsupported job type: " + candidate.data.type);
+                await handler(store, scope, candidate);
+                handlerDone = true;
               }
-            });
+            } catch (e) {
+              if (handlerDone) {
+                console.error(
+                  "Worker completion:",
+                  e instanceof Error ? e.message : e,
+                );
+              } else {
+                await transaction(store, scope, async (tx) => {
+                  const r = await tx.get(candidate.id);
+                  if (r && r.data.status !== "canceled") {
+                    const error = e instanceof Error ? e.message : "Job failed";
+                    tx.update(r, {
+                      ...r.data,
+                      status:
+                        r.kind === "job" && (r.data.attempts || 0) < 3
+                          ? "queued"
+                          : "failed",
+                      error,
+                      retryAt:
+                        Date.now() +
+                        Math.min(60000, 1000 * 2 ** (r.data.attempts || 1)),
+                    });
+                    if (r.kind === "job" && (r.data.attempts || 0) >= 3)
+                      tx.put(failureFinding(scope, r, error));
+                  }
+                });
+              }
+            }
+            if (handlerDone && candidate.kind === "job") {
+              let completed = false;
+              for (let attempt = 1; attempt <= 5 && !completed; attempt++) {
+                try {
+                  await transaction(store, scope, async (tx) => {
+                    const r = await tx.get(candidate.id);
+                    if (r && r.data.status !== "canceled")
+                      tx.update(r, {
+                        ...r.data,
+                        status: "succeeded",
+                        error: null,
+                        progress: { message: "Complete snapshot ready" },
+                      });
+                  });
+                  completed = true;
+                } catch (e) {
+                  if (attempt === 5) {
+                    console.error(
+                      "Worker completion:",
+                      e instanceof Error ? e.message : e,
+                    );
+                  } else
+                    await new Promise((r) => setTimeout(r, 250 * attempt));
+                }
+              }
+            }
           } finally {
             clearInterval(heartbeat);
           }
