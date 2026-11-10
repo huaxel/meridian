@@ -8,11 +8,16 @@ import { readdir, rm, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 
 export const SCRATCH_PREFIX = "executor-";
+export const SANDBOX_PREFIX = "job-";
 
 export async function sweepScratch(
   root: string,
   graceMs: number,
+  prefix = SCRATCH_PREFIX,
   now = Date.now(),
+  // Absolute paths never removed even when they match the prefix, e.g. a
+  // sandbox root that lives under the swept directory and is named executor-*.
+  exclude: readonly string[] = [],
 ): Promise<string[]> {
   let names: string[];
   try {
@@ -22,8 +27,9 @@ export async function sweepScratch(
   }
   const removed: string[] = [];
   for (const name of names) {
-    if (!name.startsWith(SCRATCH_PREFIX)) continue;
+    if (!name.startsWith(prefix)) continue;
     const path = resolve(root, name);
+    if (exclude.includes(path)) continue;
     try {
       const info = await stat(path);
       if (!info.isDirectory() || now - info.mtimeMs < graceMs) continue;

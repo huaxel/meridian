@@ -1182,6 +1182,10 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
       confirmed &&
       ontologyBundle(confirmed, selected, {
         materializeMerges: !largeScale,
+        // A large workspace cannot merge every member, but its composite
+        // identities can still be measured from a key-only projection, which
+        // keeps their endpoints and links in the schema-only publication.
+        promoteCompositeIdentities: largeScale,
       });
     const validationOptions = plan
       ? {
@@ -1263,7 +1267,7 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
       "Executing generated SQL and validating identities and relationships",
     );
     let report = await validateBundle(store, scope, bundle, validationOptions);
-    const omissions: ValidationOmission[] = [];
+    const omissions: ValidationOmission[] = [...(plan?.omissions ?? [])];
     // Read failures from the report passed in, not a captured report: the
     // second pruning loop revalidates after every pass, so a stale set would
     // prune actions that already pass and keep ones that now fail.
@@ -1275,11 +1279,15 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
       );
     if (plan) {
       // Confirmed definitions are not rewritten by the model; a pipeline, type or
-      // relationship that fails validation is left out instead.
-      const pipes = failed(report, "Pipeline: "),
-        types = failed(report, "Ontology: "),
-        relations = failed(report, "Relationship: ");
-      if (pipes.size || types.size || relations.size) {
+      // relationship that fails validation is left out instead. Pruning a
+      // pipeline can invalidate the types and links that read it, so repeat
+      // until nothing new fails: otherwise one unmeasurable identity fails the
+      // whole confirmed build instead of being omitted with its reason.
+      for (let pass = 0; ; pass++) {
+        const pipes = failed(report, "Pipeline: "),
+          types = failed(report, "Ontology: "),
+          relations = failed(report, "Relationship: ");
+        if (!(pipes.size || types.size || relations.size) || pass > 8) break;
         const beforePruning = bundle;
         bundle = BundleSchema.parse({
           ...bundle,

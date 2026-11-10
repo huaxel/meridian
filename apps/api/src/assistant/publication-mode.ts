@@ -7,6 +7,7 @@ import {
   type ValidationReport,
 } from "../../../../packages/shared/src/index.js";
 import type { Store } from "../store.js";
+import { pipelineId } from "../datasets.js";
 import { assert } from "../security.js";
 import { proposalHash } from "./provider.js";
 
@@ -39,6 +40,11 @@ export async function publicationReview(
   const original = BundleSchema.parse(proposal.data.bundle);
   const report = proposal.data.validation as ValidationReport;
   const types = new Map(original.ontology.map((t) => [t.name, t]));
+  // A promoted composite identity is published on a pipeline output, which is
+  // derived: validation recomputes it and records no input version for it. Only
+  // the raw datasets a link reads need a version, so a derived target is fresh
+  // by construction rather than missing.
+  const derived = new Set(original.pipelines.map((p) => pipelineId(p.name)));
   const memberLinks = original.relationships.filter(
     (r) =>
       (r.fromDatasetId &&
@@ -96,12 +102,13 @@ export async function publicationReview(
       parsed.data.totalRows >= 0 &&
       parsed.data.matchedRows >= 0 &&
       parsed.data.matchedRows <= parsed.data.totalRows &&
-      [
-        from.datasetId,
-        to.datasetId,
-        parsed.data.fromDatasetId,
-        parsed.data.toDatasetId,
-      ].every((id) => typeof report.inputVersions[id] === "string")
+      [parsed.data.fromDatasetId, parsed.data.toDatasetId].every(
+        (id) => typeof report.inputVersions[id] === "string",
+      ) &&
+      [from.datasetId, to.datasetId].every(
+        (id) =>
+          typeof report.inputVersions[id] === "string" || derived.has(id),
+      )
     )
       restored.set(rel.name, parsed.data);
   }

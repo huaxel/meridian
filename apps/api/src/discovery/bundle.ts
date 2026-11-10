@@ -2,9 +2,11 @@ import {
   type Bundle,
   type ColumnProfile,
   datasetTable,
+  MAX_BUNDLE_PIPELINES,
   type Resource,
   type SuggestedEntity,
   type SuggestedLink,
+  type ValidationOmission,
   type SuggestedOntology,
 } from "../../../../packages/shared/src/index.js";
 import { pipelineId } from "../datasets.js";
@@ -32,14 +34,30 @@ export type OntologyBundlePlan = Pick<
   | "ontology"
   | "analyticalSources"
   | "relationships"
-> & { relationshipEvidence: Map<string, SuggestedLink> };
+> & {
+  relationshipEvidence: Map<string, SuggestedLink>;
+  // Definitions the plan refuses before validation runs. Validation would prune
+  // them and re-execute every pipeline to discover the same thing, but the
+  // published report must still explain each refusal in the same shape.
+  omissions: ValidationOmission[];
+};
 
 export function ontologyBundle(
   o: SuggestedOntology,
   datasets: Map<string, Resource>,
-  options: { materializeMerges?: boolean } = {},
+  options: {
+    materializeMerges?: boolean;
+    promoteCompositeIdentities?: boolean;
+  } = {},
 ): OntologyBundlePlan {
   const materializeMerges = options.materializeMerges !== false;
+  // A schema-only plan normally has to drop composite identities: nothing
+  // computes their surrogate, and a quoted "a + b" expression is not a key.
+  // Promoting them costs one key-only scan of each anchor table, which is
+  // affordable where merging whole members is not, so large workspaces keep
+  // their composite endpoints (and the links that need them).
+  const promoteComposites =
+    !materializeMerges && options.promoteCompositeIdentities === true;
   const compositeNotes: string[] = [];
   // Composite identities publish only through a measured materialized
   // surrogate. Without merges there is nothing to compute it from, so the
@@ -50,13 +68,107 @@ export function ontologyBundle(
       e.kind === "record" && e.members.every((m) => datasets.has(m.datasetId)),
   );
   const droppedComposite = new Set<string>();
+  const structuredOmissions: ValidationOmission[] = [];
+  const droppedUnanchored = new Set<string>();
+  // A source that exported no rows cannot assert an identity: profiling marks
+  // no column a key with zero rows, so validation refuses every type anchored
+  // there. Discovering that by validating costs a full second pass over every
+  // pipeline (hours on a large workspace), so decide it here and record it.
+  // Unknown row counts stay in: unprofiled is not empty.
+  for (const e of records) {
+    const rows = datasets.get(e.anchorDatasetId)?.data.profile?.rows;
+    if (typeof rows === "number" && rows === 0) {
+      droppedUnanchored.add(e.id);
+      compositeNotes.push(
+        `Omitted "${e.name}" from the plan: its source exported no rows, so its identity cannot be asserted yet.`,
+      );
+      structuredOmissions.push({
+        kind: "objectType",
+        name: e.name,
+        reasons: [
+          "The key projection returned no rows, so this identity cannot be asserted yet",
+        ],
+      });
+    }
+  }
+  // A published primary key must be a column this type projects: a suggestion
+  // whose key is a business label ("CODE + LANG") or a member's column
+  // ("PROTOCOL_GUID" on a table that has no such column) cannot anchor a type.
+  // Publishing it produces "Unknown property", and validation then prunes it
+  // and re-runs every pipeline to discover the same thing. The profile already
+  // measured whether a key column is unique and non-null, so decide it here.
+  // Merged multi-member types project aliases across members; leave those to
+  // validation, where the merged output is what gets checked.
+  // A key string with " + " is composite even when the suggestion never filled
+  // compositeKey: the discovery sometimes names the identity ("CODE + LANG")
+  // without mapping it to columns.
+  const isComposite = (e: SuggestedEntity) =>
+    e.keyKind === "composite" ||
+    (e.compositeKey?.length ?? 0) > 0 ||
+    / \+ /.test(String(e.key ?? ""));
+  const anchorScoped = (e: SuggestedEntity) =>
+    !materializeMerges ||
+    e.members.every((m) => m.datasetId === e.anchorDatasetId);
+  for (const e of records) {
+    if (droppedUnanchored.has(e.id) || !anchorScoped(e)) continue;
+    if (isComposite(e)) continue; // composites are decided by the promotion pass
+    const anchor = datasets.get(e.anchorDatasetId);
+    const key = String(e.key ?? "");
+    // Unprofiled is not unkeyed: with no column profile there is nothing to
+    // decide on here, so leave the type to validation.
+    if (!anchor?.data.profile?.columns) continue;
+    const column = anchor.data.profile.columns.find(
+      (c: ColumnProfile) => c.name === key,
+    );
+    if (column?.primaryKey) continue;
+    droppedUnanchored.add(e.id);
+    compositeNotes.push(
+      column
+        ? `Omitted "${e.name}" from the plan: its key "${key}" is not unique and non-null on ${anchor?.name ?? "its source"}.`
+        : `Omitted "${e.name}" from the plan: its key "${key}" is not a column on ${anchor?.name ?? "its source"}.`,
+    );
+    structuredOmissions.push({
+      kind: "objectType",
+      name: e.name,
+      reasons: [
+        column
+          ? "Primary key must be unique and non-null"
+          : `Unknown property ${key}`,
+      ],
+    });
+  }
+  if (droppedUnanchored.size)
+    records = records.filter((e) => !droppedUnanchored.has(e.id));
+  // A promoted identity needs its components on the anchor: the surrogate is
+  // computed there, and no join runs to fetch a member's copy of them.
+  const promotable = (e: SuggestedEntity) =>
+    promoteComposites &&
+    (e.compositeKey?.length ?? 0) > 0 &&
+    e.compositeKey!.every((c) =>
+      datasets
+        .get(e.anchorDatasetId)
+        ?.data.profile?.columns?.some((col: ColumnProfile) => col.name === c),
+    );
   if (!materializeMerges)
     for (const e of records)
-      if (e.keyKind === "composite") {
+      if (isComposite(e) && !promotable(e)) {
         droppedComposite.add(e.id);
         compositeNotes.push(
-          `Omitted "${e.name}" from the plan: it declares composite key (${(e.compositeKey ?? []).join(" + ") || e.key}); schema-only publication is refused until a materialized build measures a surrogate identity.`,
+          `Omitted "${e.name}" from the plan: it declares composite key (${(e.compositeKey ?? []).join(" + ") || e.key}); ${
+            promoteComposites
+              ? "its key components do not all resolve to anchor columns, so no surrogate identity can be measured."
+              : "schema-only publication is refused until a materialized build measures a surrogate identity."
+          }`,
         );
+        structuredOmissions.push({
+          kind: "objectType",
+          name: e.name,
+          reasons: [
+            (e.compositeKey?.length ?? 0) > 0
+              ? "No surrogate identity could be measured from its key components"
+              : `Unknown property ${e.key}`,
+          ],
+        });
       }
   if (!materializeMerges)
     records = records.filter((e) => !droppedComposite.has(e.id));
@@ -99,9 +211,13 @@ export function ontologyBundle(
     if (!from || !to || !fromColumn || !toColumn || additionalJoinPairs.some((pair) => !pair.fromColumn || !pair.toColumn) || (l.predicate && !predicateColumn)) {
       // Both endpoints planned but a column unresolvable: record it instead
       // of dropping the suggestion silently (either materialization mode).
-      if (from && to && (!fromColumn || !toColumn))
+      if (from && to)
         droppedLinkNotes.push(
-          `Omitted relationship suggestion "${l.id}": a link column does not resolve against the planned outputs of "${from.name}" -> "${to.name}".`,
+          `Omitted relationship suggestion "${l.id}": ${
+            !fromColumn || !toColumn
+              ? "a link column does not resolve"
+              : "an additional join pair or predicate column does not resolve"
+          } against the planned outputs of "${from.name}" -> "${to.name}".`,
         );
       return [];
     }
@@ -121,6 +237,20 @@ export function ontologyBundle(
     const from = byId.get(l.from),
       to = byId.get(l.to);
     if (from && to) continue;
+    const unanchored = [l.from, l.to].find((id) => droppedUnanchored.has(id));
+    if (unanchored) {
+      const entity = o.entities.find((e) => e.id === unanchored);
+      const endpoint = entity?.name ?? unanchored;
+      compositeNotes.push(
+        `Omitted relationship suggestion "${l.id}": endpoint "${endpoint}" has no source it can be anchored on.`,
+      );
+      structuredOmissions.push({
+        kind: "relationship",
+        name: l.name || l.id,
+        reasons: [`Object type "${endpoint}" was omitted from the plan`],
+      });
+      continue;
+    }
     // Name the composite endpoint even when the other end is absent for
     // another reason; links lost for non-composite reasons stay silent as
     // before.
@@ -140,6 +270,40 @@ export function ontologyBundle(
       ] as const)
         keysFor.set(e.id, new Set([...(keysFor.get(e.id) || []), c]));
   const piped = new Set<string>();
+  // Over budget: recorded refusal instead of a silent omission. Dropping an
+  // entity also drops the links that name it, so each one is noted too.
+  const dropUnpromoted = (over: SuggestedEntity[], reason: string) => {
+    for (const e of over) {
+      droppedComposite.add(e.id);
+      compositeNotes.push(
+        `Omitted "${e.name}" from the plan: it declares composite key (${(e.compositeKey ?? []).join(" + ") || e.key}); ${reason}`,
+      );
+      structuredOmissions.push({
+        kind: "objectType",
+        name: e.name,
+        reasons: [reason],
+      });
+    }
+    if (!over.length) return;
+    const dropped = new Set(over.map((e) => e.id));
+    records = records.filter((e) => !dropped.has(e.id));
+    byId = new Map(records.map((e) => [e.id, e]));
+    planned = planned.filter((p) => {
+      const keep = !dropped.has(p.from.id) && !dropped.has(p.to.id);
+      if (!keep) {
+        const endpoint = dropped.has(p.from.id) ? p.from.name : p.to.name;
+        compositeNotes.push(
+          `Omitted relationship suggestion "${p.l.id}": endpoint "${endpoint}" was omitted (composite identity requires a materialized build).`,
+        );
+        structuredOmissions.push({
+          kind: "relationship",
+          name: p.l.name || p.l.id,
+          reasons: [`Object type "${endpoint}" was omitted from the plan`],
+        });
+      }
+      return keep;
+    });
+  };
   if (materializeMerges) {
     // Composites must merge: the surrogate is computed in the pipeline.
     // They take pipeline budget first so promotion is deterministic.
@@ -151,54 +315,89 @@ export function ontologyBundle(
       piped.add(e.id);
     for (const e of records)
       if (keysFor.has(e.id) && piped.size < 10) piped.add(e.id);
-    // Over budget: same recorded refusal as the schema-only path.
-    const over = records.filter(
-      (e) => e.keyKind === "composite" && !piped.has(e.id),
+    dropUnpromoted(
+      records.filter((e) => e.keyKind === "composite" && !piped.has(e.id)),
+      "the materialized pipeline budget is exhausted.",
     );
-    for (const e of over) {
-      droppedComposite.add(e.id);
-      compositeNotes.push(
-        `Omitted "${e.name}" from the plan: it declares composite key (${(e.compositeKey ?? []).join(" + ") || e.key}); the materialized pipeline budget is exhausted.`,
+  } else if (promoteComposites) {
+    // Every promoted identity is one key-only scan, so the widest link
+    // coverage takes the budget first; the order is fixed by link count and
+    // then by id, so the same workspace always plans the same way.
+    const linksTouching = (id: string) =>
+      o.links.filter((l) => l.from === id || l.to === id).length;
+    const candidates = records
+      .filter((e) => e.keyKind === "composite")
+      .sort(
+        (a, b) =>
+          linksTouching(b.id) - linksTouching(a.id) ||
+          a.id.localeCompare(b.id),
       );
-    }
-    if (over.length) {
-      const dropped = new Set(over.map((e) => e.id));
-      records = records.filter((e) => !dropped.has(e.id));
-      byId = new Map(records.map((e) => [e.id, e]));
-      planned = planned.filter((p) => {
-        const keep = !dropped.has(p.from.id) && !dropped.has(p.to.id);
-        if (!keep)
-          compositeNotes.push(
-            `Omitted relationship suggestion "${p.l.id}": endpoint "${dropped.has(p.from.id) ? p.from.name : p.to.name}" was omitted (composite identity requires a materialized build).`,
-          );
-        return keep;
-      });
-    }
+    for (const e of candidates)
+      if (piped.size < MAX_BUNDLE_PIPELINES) piped.add(e.id);
+    dropUnpromoted(
+      candidates.filter((e) => !piped.has(e.id)),
+      `the promoted-identity budget (${MAX_BUNDLE_PIPELINES}) is exhausted.`,
+    );
   }
   const pipelines: Bundle["pipelines"] = [],
     ontology: Bundle["ontology"] = [],
     available = new Map<string, Set<string>>(),
     keyColumns = new Map<string, Map<string, string>>();
+  let promotedCount = 0;
   for (const e of records) {
     const anchorOnly = {
       anchorDatasetId: e.anchorDatasetId,
       members: e.members.filter((m) => m.datasetId === e.anchorDatasetId),
     };
-    const cols = entityColumns(piped.has(e.id) ? e : anchorOnly, datasets);
-    const names = new Set(cols.map((c) => c.as));
+    const merged = materializeMerges && piped.has(e.id);
+    const cols = entityColumns(merged ? e : anchorOnly, datasets);
+    // A promoted identity projects its key components only. Projecting the
+    // whole anchor makes the executor profile every column with an exact
+    // count(DISTINCT): measured on a 162-column, 49M-row table that spills and
+    // exceeds 25 minutes, while the key projection finishes in about 3. From
+    // whole-member merges only the merged path needs the wide output.
+    const components =
+      e.keyKind === "composite" ? (e.compositeKey ?? []) : [];
+    // Project the components straight off the anchor rather than filtering the
+    // entity's column list: that list drops a member's via-column and collapses
+    // case-insensitive duplicates, which would silently leave a promoted
+    // identity's own key columns out of its published properties.
+    const projected =
+      piped.has(e.id) && !merged
+        ? components.flatMap((c) => {
+            const componentType = datasets
+              .get(e.anchorDatasetId)
+              ?.data.profile?.columns?.find(
+                (col: ColumnProfile) => col.name === c,
+              )?.type;
+            return componentType
+              ? [
+                  {
+                    datasetId: e.anchorDatasetId,
+                    column: c,
+                    as: c,
+                    type: componentType,
+                  },
+                ]
+              : [];
+          })
+        : cols;
+    if (piped.has(e.id) && !merged) promotedCount++;
+    const names = new Set(projected.map((c) => c.as));
     let datasetId = e.anchorDatasetId;
     let surrogate: string | undefined;
+    const pipelineNames = new Set(pipelines.map((p) => p.name));
     if (piped.has(e.id)) {
       const alias = new Map(e.members.map((m, i) => [m.datasetId, `m${i}`]));
       alias.set(e.anchorDatasetId, "a");
       const keys = new Map<string, string>(),
-        select = cols.map(
+        select = projected.map(
           (c) =>
             `${alias.get(c.datasetId)}.${q(c.column)}` +
             (c.as === c.column ? "" : ` AS ${q(c.as)}`),
         );
       for (const as of keysFor.get(e.id) || []) {
-        const c = cols.find((x) => x.as === as)!;
+        const c = projected.find((x) => x.as === as)!;
         let key = `${as}_key`;
         for (
           let n = 2;
@@ -218,8 +417,6 @@ export function ontologyBundle(
       // ("a"+"bc" vs "ab"+"c"); chr(31) keeps the tuple boundary.
       // The pipeline checks below measure joint uniqueness, non-nullness
       // and blank-freedom at validation time — no promotion without them.
-      const components =
-        e.keyKind === "composite" ? (e.compositeKey ?? []) : [];
       let blankGuard = "";
       if (components.length) {
         const a = alias.get(e.anchorDatasetId)!;
@@ -251,7 +448,10 @@ export function ontologyBundle(
       }
       const joined = new Set([e.anchorDatasetId]),
         joins: string[] = [];
-      for (let grew = true; grew; ) {
+      // Only a merge fetches member columns; a promoted identity reads its
+      // anchor alone, so its output stays one row per anchor row even when a
+      // member join would have fanned out.
+      for (let grew = merged; grew; ) {
         grew = false;
         for (const m of e.members)
           if (
@@ -271,10 +471,15 @@ export function ontologyBundle(
             grew = true;
           }
       }
-      const name = `${plural(e.name)} (${[...new Set(e.members.filter((m) => joined.has(m.datasetId)).map((m) => sourceLabel(m.source)))].join(" + ")})`;
-      datasetId = pipelineId(name);
+      const name = merged
+        ? `${plural(e.name)} (${[...new Set(e.members.filter((m) => joined.has(m.datasetId)).map((m) => sourceLabel(m.source)))].join(" + ")})`
+        : `${plural(e.name)} (${sourceLabel(e.members.find((m) => m.datasetId === e.anchorDatasetId)?.source ?? "")} key)`;
+      let unique = name;
+      for (let n = 2; pipelineNames.has(unique); n++) unique = `${name} ${n}`;
+      pipelineNames.add(unique);
+      datasetId = pipelineId(unique);
       pipelines.push({
-        name,
+        name: unique,
         description: e.description,
         inputs: [...joined],
         sql: `SELECT ${select.join(", ")} FROM ${q(datasetTable(e.anchorDatasetId))} a ${joins.join(" ")}`.trim(),
@@ -287,11 +492,14 @@ export function ontologyBundle(
           // Blanks hide inside distinct surrogate values, so text
           // components are screened on the source table in the same check
           // pass. A missing component fails the pipeline itself, closed.
+          // sum() over an empty table is NULL, not 0, and "NULL = 0" is not
+          // true: without the coalesce an empty source (16 of this workspace's
+          // 462 tables export no rows) would fail a check it vacuously passes.
           ...(surrogate && blankGuard
             ? [
                 {
                   name: `Composite key components have no blanks for ${lowerFirst(e.name)}`,
-                  sql: `SELECT sum(CASE WHEN ${blankGuard} THEN 1 ELSE 0 END) = 0 AS ok FROM ${q(datasetTable(e.anchorDatasetId))}`,
+                  sql: `SELECT coalesce(sum(CASE WHEN ${blankGuard} THEN 1 ELSE 0 END), 0) = 0 AS ok FROM ${q(datasetTable(e.anchorDatasetId))}`,
                 },
               ]
             : []),
@@ -431,6 +639,7 @@ export function ontologyBundle(
   ];
   return {
     summary: o.summary,
+    omissions: structuredOmissions,
     assumptions: [
       ...o.notes
         .filter((n) => n.kind === "case" || n.kind === "unmatched")
@@ -441,6 +650,14 @@ export function ontologyBundle(
         ),
       ...duplicateNotes,
       ...compositeNotes,
+      // One line for the whole projection policy: a reviewer comparing a
+      // promoted type with its source table should know the difference is
+      // planned, not lost.
+      ...(promotedCount
+        ? [
+            `Promoted ${promotedCount} composite identit${promotedCount === 1 ? "y" : "ies"} from key-only projections: those types list their key columns, not every source column.`,
+          ]
+        : []),
       ...droppedLinkNotes,
     ],
     catalog,

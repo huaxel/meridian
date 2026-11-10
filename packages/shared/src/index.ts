@@ -155,6 +155,11 @@ export type DatasetProfile = {
   sample: Record<string, unknown>[];
   fingerprint: string;
 };
+// A bundle's pipeline budget. Setup normally builds a handful (one per merged
+// entity); promoting composite identities in a schema-only plan needs one per
+// promoted identity, so the ceiling is set by the number of composite entities
+// a large workspace can declare, not by the merge default of 10.
+export const MAX_BUNDLE_PIPELINES = 48;
 export const BundleSchema = z.object({
   summary: z.string(),
   assumptions: z.array(z.string()),
@@ -165,7 +170,7 @@ export const BundleSchema = z.object({
       tags: z.array(z.string()),
     }),
   ),
-  pipelines: z.array(PipelineSchema).max(10),
+  pipelines: z.array(PipelineSchema).max(MAX_BUNDLE_PIPELINES),
   ontology: z.array(OntologySchema).max(1000),
   analyticalSources: z.array(AnalyticalSourceSchema).max(1000).default([]),
   relationships: z.array(RelationshipSchema).max(2000),
