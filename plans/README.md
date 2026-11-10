@@ -19,6 +19,9 @@ Reviewed 2026-11-10: diffs read, and tsc plus focused tests re-run by the review
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (reason) | REJECTED (rationale)
 
+## Integration (2026-11-11)
+All eight plans were integrated, one commit each, on branch `worktree-review-fixes` (worktree `.claude/worktrees/review-fixes`), on top of the user's pending composite-promotion work (commit `521a063`). Conflicts resolved by hand: plan 001 vs `server.ts` persist work (two leftover `err`/`out` references), and plans 003+004 together exceeded the login rate limit in `tests/auth.test.ts` (tests now share one session). Gate on the integrated branch: `tsc --noEmit` 0, `tsc -p tsconfig.server.json --noEmit` 0, `vitest run` 474 passed / 22 skipped. Not run: `pnpm build` (no pnpm on PATH), opt-in suites. Nothing pushed. The per-plan `advisor/*` branches and herdr worktrees still hold the original uncommitted executor output and can be discarded.
+
 ## Notes
 - **Anomaly (001):** branch `advisor/001-executor-child-io` has an unexpected local commit `b558206 "pi settings"` (author is the user) that contains only `services/executor/src/child-io.ts`. Neither the plan nor the prompt asked for a commit; it is probably a side effect of the user's `pi` setup (a `git-interceptor` extension). The plan's other changes are uncommitted on top. Not pushed.
 - **Merge conflicts:** the user's uncommitted composite-promotion work and the `review-fixes` worktree fixes are not in `main`; plan 001 (`server.ts`) and 006 (`engine.ts`) touch files they also modify, so expect small textual conflicts.
