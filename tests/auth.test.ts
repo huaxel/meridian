@@ -132,6 +132,93 @@ it("still honors workspace Bearer tokens without cookies", async () => {
   expect(viaToken.json().workspaces[0].id).toBe(scope);
 });
 
+it("creates tokens with a default ninety-day expiry", async () => {
+  const cookie = sessionCookie(await login(TEST_PASSWORD));
+  const me = await app.inject({
+    method: "GET",
+    url: "/api/v1/me",
+    headers: { cookie },
+  });
+  const scope = me.json().workspaces[0].id;
+  const before = Date.now();
+  const created = await app.inject({
+    method: "POST",
+    url: `/api/v1/workspaces/${scope}/tokens`,
+    headers: { cookie },
+    payload: { name: "Ninety day token", readOnly: true },
+  });
+  const after = Date.now();
+  expect(created.statusCode).toBe(200);
+  expect(created.json().expiresAt).toBeGreaterThanOrEqual(
+    before + 90 * 86_400_000,
+  );
+  expect(created.json().expiresAt).toBeLessThanOrEqual(
+    after + 90 * 86_400_000,
+  );
+});
+
+it("rejects token expiry longer than one year", async () => {
+  const cookie = sessionCookie(await login(TEST_PASSWORD));
+  const scope = (
+    await app.inject({ method: "GET", url: "/api/v1/me", headers: { cookie } })
+  ).json().workspaces[0].id;
+  const response = await app.inject({
+    method: "POST",
+    url: `/api/v1/workspaces/${scope}/tokens`,
+    headers: { cookie },
+    payload: { name: "Too long", readOnly: true, expiresInDays: 400 },
+  });
+  expect(response.statusCode).toBe(400);
+});
+
+it("does not allow API tokens to mint replacement tokens", async () => {
+  const cookie = sessionCookie(await login(TEST_PASSWORD));
+  const scope = (
+    await app.inject({ method: "GET", url: "/api/v1/me", headers: { cookie } })
+  ).json().workspaces[0].id;
+  const created = await app.inject({
+    method: "POST",
+    url: `/api/v1/workspaces/${scope}/tokens`,
+    headers: { cookie },
+    payload: { name: "Minting token", readOnly: false },
+  });
+  const response = await app.inject({
+    method: "POST",
+    url: `/api/v1/workspaces/${scope}/tokens`,
+    headers: { authorization: "Bearer " + created.json().token },
+    payload: { name: "Replacement", readOnly: true },
+  });
+  expect(response.statusCode).toBe(403);
+});
+
+it("rejects expired API tokens", async () => {
+  const cookie = sessionCookie(await login(TEST_PASSWORD));
+  const me = await app.inject({
+    method: "GET",
+    url: "/api/v1/me",
+    headers: { cookie },
+  });
+  const userId = me.json().user.id;
+  const expiredValue = "expired-token-" + randomUUID();
+  await transaction(store, "global", async (tx) => {
+    tx.put(
+      resource(
+        "global",
+        "token",
+        "Expired token",
+        { userId, expiresAt: Date.now() - 1 },
+        digest(expiredValue),
+      ),
+    );
+  });
+  const response = await app.inject({
+    method: "GET",
+    url: "/api/v1/me",
+    headers: { authorization: "Bearer " + expiredValue },
+  });
+  expect(response.statusCode).toBe(401);
+});
+
 it("refuses non-loopback origins without a password", () => {
   config.encryptionKey = "x".repeat(32);
   config.internalKey = "x".repeat(32);

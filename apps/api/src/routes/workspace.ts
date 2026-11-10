@@ -681,23 +681,38 @@ export function registerWorkspaceRoutes(
     return result;
   });
   app.post("/api/v1/workspaces/:w/tokens", async (req) => {
-    const a = await access(req, "owner"),
-      b = z
-        .object({ name: z.string(), readOnly: z.boolean().default(true) })
+    const a = await access(req, "owner");
+    assert(
+      a.session.kind !== "token",
+      "Create API tokens from a signed-in session, not another token",
+      403,
+    );
+    const b = z
+        .object({
+          name: z.string(),
+          readOnly: z.boolean().default(true),
+          expiresInDays: z.number().int().min(1).max(365).default(90),
+        })
         .parse(req.body),
-      raw = token();
+      raw = token(),
+      expiresAt = Date.now() + b.expiresInDays * 86_400_000;
     await transaction(store, "global", async (tx) =>
       tx.put(
         resource(
           "global",
           "token",
           b.name,
-          { userId: a.user.id, workspaceId: a.scope, readOnly: b.readOnly },
+          {
+            userId: a.user.id,
+            workspaceId: a.scope,
+            readOnly: b.readOnly,
+            expiresAt,
+          },
           digest(raw),
         ),
       ),
     );
-    return { token: raw, id: digest(raw) };
+    return { token: raw, id: digest(raw), expiresAt };
   });
   app.delete("/api/v1/workspaces/:w/tokens/:id", async (req: any) => {
     const a = await access(req, "owner");
