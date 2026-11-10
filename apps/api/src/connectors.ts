@@ -85,7 +85,7 @@ function mysqlPool(c: ConnectorConfig) {
   });
 }
 function pgPool(c: ConnectorConfig) {
-  return new pg.Pool(postgresPoolConfig(c));
+  return new pg.Pool(postgresPoolConfig(c, { importTimeouts: true }));
 }
 const identifier = (s: string, kind: string) =>
   kind === "mysql"
@@ -507,9 +507,14 @@ export async function importSource(
     } else if (kind === "s3") {
       assert(c.key, "Select an object key");
       const client = s3(c);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(),
+        Number(process.env.IMPORT_S3_TIMEOUT_MS) || 30 * 60_000,
+      );
       try {
         const result = await client.send(
           new GetObjectCommand({ Bucket: c.bucket, Key: c.key }),
+          { abortSignal: controller.signal },
         );
         assert(result.Body, "Empty S3 object");
         for await (const chunk of result.Body as any) {
@@ -529,7 +534,13 @@ export async function importSource(
           bytes: out.bytesWritten,
         });
         return { file, records: count };
+      } catch (error) {
+        if (controller.signal.aborted)
+          throw new Error("S3 import timed out", { cause: error });
+        throw error;
       } finally {
+        clearTimeout(timer);
+        if (controller.signal.aborted) out.destroy();
         client.destroy();
       }
     } else throw new Error("Upload files through the upload endpoint");
