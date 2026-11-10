@@ -503,7 +503,8 @@ export async function execute(
     // Profile one column at a time: exact counts with a per-column fallback
     // to approximate under memory pressure, so a single wide column never
     // strips key evidence from the other columns.
-    let approximateDistincts = job.approximateProfile === true;
+    const forceApproximate = job.approximateProfile === true;
+    let approximateDistincts = forceApproximate;
     const columns = [];
     for (const [i, col] of schema.entries()) {
       const name = String(col.column_name),
@@ -520,7 +521,7 @@ export async function execute(
       let null_count: unknown,
         distincts: unknown,
         blanks: unknown,
-        exact = !approximateDistincts;
+        exact = !forceApproximate;
       if (exact) {
         try {
           const row = (
