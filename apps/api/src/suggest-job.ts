@@ -78,7 +78,7 @@ export async function runSuggestJob(
   ).length;
   if (curatedCount) {
     await transaction(store, scope, async (tx) => {
-      const active = (await tx.list("job")).some(
+      const active = (await tx.listByStatus("job", ["queued", "running"])).some(
         (j) =>
           j.data.type === "validate" &&
           j.data.onboardingSignature === onboardingSignature &&

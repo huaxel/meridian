@@ -252,7 +252,7 @@ export function registerOnboarding(
     const discovery = await testedConnection(body.kind, resolved.config);
     return transaction(store, a.scope, async (tx) => {
       const source = (await tx.get(old.id))!;
-      for (const job of await tx.list("job"))
+      for (const job of await tx.listByStatus("job", ["queued", "running"]))
         if (
           job.data.sourceId === source.id &&
           ["queued", "running"].includes(job.data.status)
@@ -501,14 +501,16 @@ export function registerOnboarding(
             ? m.ontology.value
             : m.ontologySuggestion);
       if (!fresh) {
-        for (const j of await tx.list("job"))
+        for (const j of await tx.listByStatus("job", ["queued", "running"]))
           if (
             j.data.type === "suggest" &&
             j.data.status === "queued" &&
             j.data.onboardingSignature !== state.signature
           )
             tx.update(j, { ...j.data, status: "canceled" });
-        const active = (await tx.list("job")).some(
+        const active = (
+          await tx.listByStatus("job", ["queued", "running"])
+        ).some(
           (j) =>
             j.data.type === "suggest" &&
             j.data.onboardingSignature === state.signature &&

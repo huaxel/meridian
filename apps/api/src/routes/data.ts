@@ -250,7 +250,9 @@ export function registerDataRoutes(
       source = await store.get(a.scope, req.params.id);
     assert(source?.kind === "source", "Source unavailable", 404);
     return transaction(store, a.scope, async (tx) => {
-      const pending = (await tx.list("job")).find(
+      const pending = (
+        await tx.listByStatus("job", ["queued", "running"])
+      ).find(
         (j) =>
           j.data.sourceId === source.id &&
           ["queued", "running"].includes(j.data.status),
