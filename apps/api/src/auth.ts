@@ -1,4 +1,9 @@
-import { randomBytes, scrypt as scryptCb, timingSafeEqual } from "node:crypto";
+import {
+  createHmac,
+  randomBytes,
+  scrypt as scryptCb,
+  timingSafeEqual,
+} from "node:crypto";
 import { promisify } from "node:util";
 import { config } from "./config.js";
 import { resource, transaction, type Store } from "./store.js";
@@ -29,12 +34,22 @@ export async function verifyPassword(input: string): Promise<boolean> {
     hash.length === v.hash.length && timingSafeEqual(hash, v.hash)
   );
 }
+
+export function passwordFingerprint(): string | undefined {
+  if (!config.authPassword) return undefined;
+  // The internal-key HMAC avoids persisting anything password-equivalent that
+  // could be guessed offline.
+  return createHmac("sha256", config.internalKey)
+    .update("meridian-session-v1:" + config.authPassword)
+    .digest("hex");
+}
 // Password sessions are unpredictable, marked, and expiring. The predictable
 // local-session id is never issued here and never accepted via cookie.
 export async function createPasswordSession(store: Store, userId: string) {
   const session = resource("global", "session", "Password session", {
     userId,
     viaPassword: true,
+    pw: passwordFingerprint(),
     expiresAt: Date.now() + SESSION_MAX_AGE_SECONDS * 1000,
   });
   await transaction(store, "global", async (tx) => {

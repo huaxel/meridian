@@ -248,13 +248,18 @@ export async function execute(
 ) {
   if (!safePart(job.scope) || (job.version && !safePart(job.version)))
     throw new Error("Invalid storage identity");
-  const out = resolve(root, "datasets", job.scope, `${job.version}.parquet`);
   // Stream-query mode runs inside a mount namespace that masks /data and /mnt,
   // so the engine must not create or validate any path there: the server has
   // already bound the authorized inputs into the sandbox and pointed
-  // DUCKDB_TEMP_DIR at a writable scratch outside the masked roots.
+  // DUCKDB_TEMP_DIR at a writable scratch outside the masked roots. A persisted
+  // result therefore lands in that scratch, and the server moves it into
+  // datasets/<scope>/ once the sandboxed child has exited.
   const streamQuery =
     process.env.EXECUTOR_MODE === "stream" && job.mode === "query";
+  const persistInSandbox = streamQuery && job.persist === true && !!job.sandbox?.tmp;
+  const out = persistInSandbox
+    ? resolve(job.sandbox!.tmp!, "persist.parquet")
+    : resolve(root, "datasets", job.scope, `${job.version}.parquet`);
   if (!job.sourcePath && !streamQuery)
     await mkdir(dirname(out), { recursive: true });
   const resolveSource = async (
@@ -498,7 +503,8 @@ export async function execute(
     // Profile one column at a time: exact counts with a per-column fallback
     // to approximate under memory pressure, so a single wide column never
     // strips key evidence from the other columns.
-    let approximateDistincts = job.approximateProfile === true;
+    const forceApproximate = job.approximateProfile === true;
+    let approximateDistincts = forceApproximate;
     const columns = [];
     for (const [i, col] of schema.entries()) {
       const name = String(col.column_name),
@@ -515,7 +521,7 @@ export async function execute(
       let null_count: unknown,
         distincts: unknown,
         blanks: unknown,
-        exact = !approximateDistincts;
+        exact = !forceApproximate;
       if (exact) {
         try {
           const row = (

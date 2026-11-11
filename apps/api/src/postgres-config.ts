@@ -1,7 +1,10 @@
 import type { PoolConfig } from "pg";
 import { assert, AppError } from "./security.js";
 
-export function postgresPoolConfig(c: Record<string, any>): PoolConfig {
+export function postgresPoolConfig(
+  c: Record<string, any>,
+  options: { importTimeouts?: boolean } = {},
+): PoolConfig {
   let host = c.host,
     port = Number(c.port || 5432),
     user = c.user,
@@ -69,6 +72,13 @@ export function postgresPoolConfig(c: Record<string, any>): PoolConfig {
     enableChannelBinding: !!c.enableChannelBinding,
     max: 2,
     connectionTimeoutMillis: 10000,
+    ...(options.importTimeouts
+      ? {
+          statement_timeout:
+            Number(process.env.IMPORT_QUERY_TIMEOUT_MS) || 300_000,
+          query_timeout: Number(process.env.IMPORT_QUERY_TIMEOUT_MS) || 300_000,
+        }
+      : {}),
     ssl: tls
       ? { rejectUnauthorized: true, ...(c.ca ? { ca: c.ca } : {}) }
       : false,

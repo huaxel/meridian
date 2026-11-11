@@ -26,6 +26,7 @@ import {
   SESSION_MAX_AGE_SECONDS,
   createPasswordSession,
   isSessionCookieId,
+  passwordFingerprint,
   revokePasswordSession,
   verifyPassword,
 } from "./auth.js";
@@ -174,6 +175,7 @@ export async function createApp(store: Store) {
       assert(
         s?.kind === "session" &&
           s.data.viaPassword === true &&
+          s.data.pw === passwordFingerprint() &&
           (!s.data.expiresAt || s.data.expiresAt > Date.now()),
         "Session expired. Log in again.",
         401,
@@ -329,6 +331,7 @@ export async function createApp(store: Store) {
         sameSite: "lax",
         path: "/",
         maxAge: SESSION_MAX_AGE_SECONDS,
+        secure: config.origin.startsWith("https://"),
       });
       return { ok: true };
     },

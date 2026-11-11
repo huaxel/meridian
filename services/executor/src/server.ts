@@ -3,10 +3,18 @@ import Fastify from "fastify";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { timingSafeEqual } from "node:crypto";
-import { mkdir, mkdtemp, rm, stat, writeFile, realpath } from "node:fs/promises";
+import {
+  copyFile,
+  mkdir,
+  mkdtemp,
+  rm,
+  stat,
+  writeFile,
+  realpath,
+} from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { resolve, isAbsolute, sep, dirname } from "node:path";
+import { resolve, resolve as pathResolve, isAbsolute, sep, dirname } from "node:path";
 
 const app = Fastify({ bodyLimit: 1024 * 1024, logger: true });
 const runnerPath = fileURLToPath(new URL("./runner.js", import.meta.url));
@@ -23,8 +31,9 @@ const shq = shellQuote;
 const launch = runnerLaunch(runnerPath, existsSync(runnerPath));
 
 import { createGate } from "./gate.js";
-import { sweepScratch, SCRATCH_PREFIX } from "./scratch.js";
+import { sweepScratch, SCRATCH_PREFIX, SANDBOX_PREFIX } from "./scratch.js";
 import { runnerLaunch, shellQuote } from "./runner-launch.js";
+import { attachChildIo } from "./child-io.js";
 
 const concurrency = Math.max(
   1,
@@ -83,7 +92,7 @@ async function prepareSandbox(job: any): Promise<Prepared> {
     process.env.EXECUTOR_SANDBOX_ROOT || resolve(tmpdir(), "executor-sbx"),
   );
   await mkdir(sbxRoot, { recursive: true });
-  const dir = await mkdtemp(resolve(sbxRoot, "job-"));
+  const dir = await mkdtemp(resolve(sbxRoot, SANDBOX_PREFIX));
   const inDir = resolve(dir, "in");
   const tmp = resolve(dir, "tmp");
   const mask = resolve(dir, "mask");
@@ -214,6 +223,12 @@ app.post("/execute", async (req, reply) => {
     const job = prepared.enabled
       ? { ...body, sandbox: prepared.sandbox }
       : body;
+    let isolatedTempDir: string | undefined;
+    if (!prepared.enabled) {
+      const tempRoot = resolve(process.env.DUCKDB_TEMP_DIR || "/tmp");
+      await mkdir(tempRoot, { recursive: true });
+      isolatedTempDir = await mkdtemp(resolve(tempRoot, SCRATCH_PREFIX));
+    }
     return await new Promise((resolve) => {
       // The child only ever gets PATH, DATA_DIR and DUCKDB_* — never the
       // ENCRYPTION_KEY or INTERNAL_KEY, so even /proc/<pid>/environ in the
@@ -230,7 +245,7 @@ app.post("/execute", async (req, reply) => {
         DUCKDB_TEMP_LIMIT: process.env.DUCKDB_TEMP_LIMIT || "2GB",
         DUCKDB_TEMP_DIR: prepared.enabled
           ? prepared.sandbox!.tmp
-          : process.env.DUCKDB_TEMP_DIR || "/tmp",
+          : isolatedTempDir!,
       };
       // Stream: the per-job user+mount namespace IS the sandbox. Materialize:
       // the in-memory copy + DuckDB lockdown (existing behavior).
@@ -245,8 +260,10 @@ app.post("/execute", async (req, reply) => {
             env,
             stdio: ["pipe", "pipe", "pipe"],
           });
-      let out = "",
-        err = "";
+      const io = attachChildIo(child, {
+        maxOut: 10_000_000,
+        onOverflow: () => child.kill("SIGKILL"),
+      });
       const timer = setTimeout(
         () => child.kill("SIGKILL"),
         Number(process.env.EXECUTOR_TIMEOUT_MS || 120000),
@@ -254,28 +271,80 @@ app.post("/execute", async (req, reply) => {
       const cleanup = () => {
         if (prepared.enabled && prepared.dir)
           rm(prepared.dir, { recursive: true, force: true }).catch(() => {});
+        if (isolatedTempDir)
+          rm(isolatedTempDir, { recursive: true, force: true }).catch(() => {});
       };
-      child.stdout.on("data", (x) => {
-        out += x;
-        if (out.length > 10_000_000) child.kill("SIGKILL");
-      });
-      child.stderr.on("data", (x) => (err += x));
       child.on("error", (e) => {
         clearTimeout(timer);
         cleanup();
         resolve(reply.code(500).send({ error: e.message }));
       });
-      child.on("close", (code) => {
+      child.on("close", async (code) => {
         clearTimeout(timer);
-        cleanup();
-        if (code !== 0)
+        if (code !== 0) {
+          cleanup();
           return resolve(
             reply.code(422).send({
-              error: err.slice(0, 1500) || "Query exceeded execution limits",
+              error:
+                io.err().slice(0, 1500) || "Query exceeded execution limits",
             }),
           );
+        }
+        // A streamed query persists its result in the sandbox scratch, because
+        // the child's /data is masked. Move it into the dataset store here, from
+        // outside the namespace, before the scratch is removed.
+        const persisted = body as {
+          mode?: string;
+          persist?: boolean;
+          scope?: string;
+          version?: string;
+        };
+        if (
+          prepared.enabled &&
+          persisted.mode === "query" &&
+          persisted.persist === true
+        ) {
+          // Same rule as the engine's safePart: no dots, so "." and ".." can
+          // never steer the move outside datasets/.
+          const safe = (part: unknown) =>
+            typeof part === "string" && /^[a-zA-Z0-9_-]{1,100}$/.test(part);
+          if (!safe(persisted.scope) || !safe(persisted.version)) {
+            cleanup();
+            return resolve(
+              reply.code(422).send({ error: "Invalid storage identity" }),
+            );
+          }
+          // Inside this handler `resolve` is the reply promise resolver, so the
+          // path helper needs its own name.
+          const scratch = prepared.sandbox!.tmp!;
+          const from = pathResolve(scratch, "persist.parquet");
+          const dest = pathResolve(
+            process.env.DATA_DIR || ".data",
+            "datasets",
+            String(persisted.scope),
+            `${String(persisted.version)}.parquet`,
+          );
+          try {
+            await mkdir(dirname(dest), { recursive: true });
+            // Sandbox scratch and the data volume can be different mounts.
+            await copyFile(from, dest);
+            await rm(from, { force: true });
+          } catch (e) {
+            cleanup();
+            return resolve(
+              reply
+                .code(500)
+                .send({
+                  error:
+                    "Could not store the query result: " +
+                    (e instanceof Error ? e.message : String(e)),
+                }),
+            );
+          }
+        }
+        cleanup();
         try {
-          resolve(JSON.parse(out));
+          resolve(JSON.parse(io.out()));
         } catch {
           resolve(reply.code(500).send({ error: "Invalid executor response" }));
         }
@@ -295,6 +364,31 @@ const swept = await sweepScratch(
 if (swept.length)
   app.log.info(
     `Removed ${swept.length} stale ${SCRATCH_PREFIX}* director${swept.length === 1 ? "y" : "ies"} left by killed jobs`,
+  );
+const sandboxRoot = resolve(
+  process.env.EXECUTOR_SANDBOX_ROOT || resolve(tmpdir(), "executor-sbx"),
+);
+const sweptSandboxes = await sweepScratch(
+  sandboxRoot,
+  Number(process.env.EXECUTOR_TIMEOUT_MS || 120000),
+  SANDBOX_PREFIX,
+);
+if (sweptSandboxes.length)
+  app.log.info(
+    `Removed ${sweptSandboxes.length} stale ${SANDBOX_PREFIX}* sandbox director${sweptSandboxes.length === 1 ? "y" : "ies"} left by killed jobs`,
+  );
+const duckdbTempRoot = resolve(process.env.DUCKDB_TEMP_DIR || "/tmp");
+const sweptDuckdbTemp = await sweepScratch(
+  duckdbTempRoot,
+  Number(process.env.EXECUTOR_TIMEOUT_MS || 120000),
+  SCRATCH_PREFIX,
+  Date.now(),
+  // The default sandbox root (<tmp>/executor-sbx) matches SCRATCH_PREFIX.
+  [sandboxRoot],
+);
+if (sweptDuckdbTemp.length)
+  app.log.info(
+    `Removed ${sweptDuckdbTemp.length} stale ${SCRATCH_PREFIX}* DuckDB temp director${sweptDuckdbTemp.length === 1 ? "y" : "ies"} left by killed jobs`,
   );
 await app.listen({
   port: Number(process.env.EXECUTOR_PORT || 3002),

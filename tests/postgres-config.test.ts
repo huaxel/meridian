@@ -2,6 +2,38 @@ import { it, expect } from "vitest";
 import { postgresPoolConfig } from "../apps/api/src/postgres-config.js";
 import { redact } from "../apps/api/src/security.js";
 
+it("applies the default PostgreSQL import statement timeout", () => {
+  const previous = process.env.IMPORT_QUERY_TIMEOUT_MS;
+  delete process.env.IMPORT_QUERY_TIMEOUT_MS;
+  try {
+    expect(
+      postgresPoolConfig(
+        { host: "db", user: "u", password: "p", database: "d" },
+        { importTimeouts: true },
+      ),
+    ).toMatchObject({ statement_timeout: 300000, query_timeout: 300000 });
+  } finally {
+    if (previous === undefined) delete process.env.IMPORT_QUERY_TIMEOUT_MS;
+    else process.env.IMPORT_QUERY_TIMEOUT_MS = previous;
+  }
+});
+
+it("honors the configured PostgreSQL import statement timeout", () => {
+  const previous = process.env.IMPORT_QUERY_TIMEOUT_MS;
+  process.env.IMPORT_QUERY_TIMEOUT_MS = "12345";
+  try {
+    expect(
+      postgresPoolConfig(
+        { host: "db", user: "u", password: "p", database: "d" },
+        { importTimeouts: true },
+      ),
+    ).toMatchObject({ statement_timeout: 12345, query_timeout: 12345 });
+  } finally {
+    if (previous === undefined) delete process.env.IMPORT_QUERY_TIMEOUT_MS;
+    else process.env.IMPORT_QUERY_TIMEOUT_MS = previous;
+  }
+});
+
 it("reads encoded PostgreSQL URL credentials and requires verified TLS by default", () => {
   const c = postgresPoolConfig({
     connectionString:

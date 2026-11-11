@@ -78,6 +78,63 @@ it("retries memory-bound profile counts approximately without claiming keys", as
   ).toBe(true);
 });
 
+it("retries later columns exactly after an earlier column falls back", async () => {
+  duckdb.runAndReadAll.mockImplementation(async (sql: string) => {
+    if (sql === "SELECT count(*) n FROM result") return result([{ n: "2" }]);
+    if (sql === "DESCRIBE result")
+      return result([
+        { column_name: "wide", column_type: "VARCHAR" },
+        { column_name: "id", column_type: "INTEGER" },
+      ]);
+    if (sql.startsWith("SELECT * FROM result LIMIT"))
+      return result([
+        { wide: "a", id: 1 },
+        { wide: "b", id: 2 },
+      ]);
+    if (sql.includes('count(DISTINCT "wide")'))
+      throw new Error("Out of Memory Error: test pressure");
+    if (sql.includes('approx_count_distinct("wide")'))
+      return result([{ null_count: "0", distincts: "2" }]);
+    if (sql.includes('count(DISTINCT "id")'))
+      return result([{ null_count: "0", distincts: "2" }]);
+    if (sql.includes("row_hashes") && sql.includes("count(DISTINCT h)"))
+      return result([{ fingerprint: "19", hash_sum: "23", duplicate_rows: "0" }]);
+    throw new Error(`Unexpected query: ${sql}`);
+  });
+
+  const profile = (
+    await execute({
+      mode: "query",
+      scope: "workspace",
+      version: "result",
+      inputs: [],
+      sql: "SELECT 1 AS id",
+    })
+  ).profile;
+
+  expect(profile).toMatchObject({ rows: 2, approximate: true });
+  expect(profile.columns[0]).toMatchObject({
+    name: "wide",
+    distinct: 2,
+    primaryKey: false,
+  });
+  expect(profile.columns[1]).toMatchObject({
+    name: "id",
+    distinct: 2,
+    primaryKey: true,
+  });
+  expect(
+    duckdb.runAndReadAll.mock.calls.some(([sql]) =>
+      String(sql).includes('approx_count_distinct("wide")'),
+    ),
+  ).toBe(true);
+  expect(
+    duckdb.runAndReadAll.mock.calls.some(([sql]) =>
+      String(sql).includes('count(DISTINCT "id")'),
+    ),
+  ).toBe(true);
+});
+
 it("can start with approximate counts for a known oversized file", async () => {
   const profile = (
     await execute({

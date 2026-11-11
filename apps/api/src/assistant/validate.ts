@@ -204,7 +204,16 @@ export async function validateBundle(
       const col = d.data.profile.columns.find(
         (x: any) => x.name === type.primaryKey,
       );
-      assert(col.primaryKey, "Primary key must be unique and non-null");
+      assert(
+        col.primaryKey,
+        // A promoted identity over a source that exported no rows cannot assert
+        // one yet: profiling marks no column a key with zero rows, by design.
+        // Say so, rather than blaming uniqueness on an empty table.
+        derivedIds.has(type.datasetId) &&
+          (d.data.profile?.rows ?? 0) === 0
+          ? "The key projection returned no rows, so this identity cannot be asserted yet"
+          : "Primary key must be unique and non-null",
+      );
       if (!derivedIds.has(type.datasetId))
         inputVersions[type.datasetId] = d.data.activeVersion;
       // Warnings only, by policy: empty strings pass uniqueness/non-null

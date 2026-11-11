@@ -2,7 +2,11 @@ import { afterEach, beforeEach, expect, it } from "vitest";
 import { mkdir, mkdtemp, rm, utimes, writeFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { sweepScratch, SCRATCH_PREFIX } from "../services/executor/src/scratch.js";
+import {
+  sweepScratch,
+  SCRATCH_PREFIX,
+  SANDBOX_PREFIX,
+} from "../services/executor/src/scratch.js";
 
 let root: string;
 beforeEach(async () => {
@@ -32,6 +36,32 @@ it("removes only stale executor scratch directories", async () => {
   expect(removed).toEqual([SCRATCH_PREFIX + "stale"]);
   const left = (await readdir(root)).sort();
   expect(left).toEqual([SCRATCH_PREFIX + "fresh", "datasets", "keep.txt"].sort());
+});
+
+it("removes only stale sandbox jobs when given the sandbox prefix", async () => {
+  const hour = 3_600_000;
+  await entry(SANDBOX_PREFIX + "stale", 2 * hour);
+  await entry(SANDBOX_PREFIX + "fresh", 1000);
+  await entry(SCRATCH_PREFIX + "unrelated", 2 * hour);
+
+  const removed = await sweepScratch(root, hour, SANDBOX_PREFIX);
+  expect(removed).toEqual([SANDBOX_PREFIX + "stale"]);
+  const left = (await readdir(root)).sort();
+  expect(left).toEqual(
+    [SANDBOX_PREFIX + "fresh", SCRATCH_PREFIX + "unrelated"].sort(),
+  );
+});
+
+it("never removes an excluded path even when it matches the prefix", async () => {
+  const hour = 3_600_000;
+  await entry(SCRATCH_PREFIX + "sbx", 2 * hour);
+  await entry(SCRATCH_PREFIX + "stale", 2 * hour);
+
+  const removed = await sweepScratch(root, hour, SCRATCH_PREFIX, Date.now(), [
+    join(root, SCRATCH_PREFIX + "sbx"),
+  ]);
+  expect(removed).toEqual([SCRATCH_PREFIX + "stale"]);
+  expect(await readdir(root)).toContain(SCRATCH_PREFIX + "sbx");
 });
 
 it("is a no-op when there is no scratch directory yet", async () => {
