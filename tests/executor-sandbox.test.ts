@@ -189,6 +189,20 @@ describe.skipIf(!process.env.TEST_EXECUTOR_SANDBOX || !usernsOk)(
       expect(j.rows).toHaveLength(4);
     });
 
+    it("serves a basic-profile query through the sandbox without persisting", async () => {
+      const r = await query("SELECT * FROM d ORDER BY grp", {
+        profile: "basic",
+        limit: 2,
+        offset: 1,
+      });
+      expect(r.status).toBe(200);
+      const j = JSON.parse(r.body);
+      // The lazy view must read the bound Parquet inside the namespace.
+      expect(j.profile.basic).toBe(true);
+      expect(j.profile.rows).toBe(10000);
+      expect(j.rows).toHaveLength(2);
+    });
+
     it("reads a partition file list as one table (stream mode)", async () => {
       const r = await post(
         "/execute",

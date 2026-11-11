@@ -137,7 +137,9 @@ export function registerDataRoutes(
       a.scope,
       [ds.id],
       `SELECT * FROM "${datasetTable(ds.id)}"`,
-      b,
+      // The Data page shows only the page of rows; profiling the whole table
+      // for every page turn is what made large datasets slow to browse.
+      { ...b, profile: "basic" },
     );
   });
   app.patch("/api/v1/workspaces/:w/datasets/:id", async (req: any) => {

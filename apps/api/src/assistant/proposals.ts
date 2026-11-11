@@ -247,6 +247,7 @@ export async function publishProposal(
         version: randomUUID(),
         offset,
         limit: 500,
+        profile: "basic",
       });
       const staged = r.rows.map((row) => {
         const key = String(row[type.primaryKey]),
@@ -328,6 +329,7 @@ export async function publishProposal(
         version: randomUUID(),
         offset,
         limit: 500,
+        profile: "basic",
       });
       total = r.profile.rows;
       await transaction(store, scope, async (tx) => {

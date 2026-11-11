@@ -371,6 +371,9 @@ export async function queryDatasets(
     limit?: number;
     offset?: number;
     persist?: boolean;
+    // "basic" for callers that read only `rows` or the row count: see
+    // Execution.profile in the executor engine.
+    profile?: "full" | "basic";
     filters?: {
       datasetId: string;
       column: string;
@@ -460,6 +463,7 @@ export async function queryDatasets(
     limit: opts.limit,
     offset: opts.offset,
     persist: opts.persist,
+    profile: opts.profile,
   });
   return {
     ...result,

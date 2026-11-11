@@ -17,6 +17,8 @@ import {
 export const quote = (v: string) => '"' + v.replaceAll('"', '""') + '"';
 const lit = (v: string) => "'" + v.replaceAll("'", "''") + "'";
 const safePart = (s: string) => /^[a-zA-Z0-9_-]{1,100}$/.test(s);
+const SENSITIVE_NAME =
+  /email|phone|ssn|password|secret|token|address|birth|credit/i;
 const isMemoryLimitError = (error: unknown) =>
   /out of memory|memory limit|could not allocate/i.test(String(error));
 // Profiling must never fail an import, and a very wide table can exhaust
@@ -83,6 +85,14 @@ export type Execution = {
   offset?: number;
   limit?: number;
   approximateProfile?: boolean;
+  // Query mode only. "basic" (callers that only read `rows` or the row count)
+  // skips the per-column distinct/null passes and the whole-row hash, and reads
+  // the query lazily instead of materializing it, so paging a large table costs
+  // the page, not the table. The returned profile then has `basic: true`: its
+  // `nulls`, `distinct` and `primaryKey` are unmeasured. Ignored when `persist`
+  // is set, because a persisted result becomes a dataset and needs the full
+  // profile. Default "full".
+  profile?: "full" | "basic";
   // Stream mode only: the executor server bind-mounted each authorized input's
   // files into private paths (sandbox.in[i] is the list of bound paths for
   // inputs[i] — one per partition file) and masked the rest of the filesystem
@@ -241,11 +251,18 @@ async function writePartitions(
   return partitions;
 }
 
+export type ExecutionResult = {
+  profile: DatasetProfile;
+  version: string | undefined;
+  rows: Record<string, any>[];
+  partitions?: { key: string; file: string; rows: number; size: number }[];
+};
+
 export async function execute(
   job: Execution,
   root = resolve(process.env.DATA_DIR || ".data"),
   localRoot = process.env.LOCAL_DATA_PATH || "/mnt/parquet",
-) {
+): Promise<ExecutionResult> {
   if (!safePart(job.scope) || (job.version && !safePart(job.version)))
     throw new Error("Invalid storage identity");
   // Stream-query mode runs inside a mount namespace that masks /data and /mnt,
@@ -260,6 +277,8 @@ export async function execute(
   const out = persistInSandbox
     ? resolve(job.sandbox!.tmp!, "persist.parquet")
     : resolve(root, "datasets", job.scope, `${job.version}.parquet`);
+  const basicProfile =
+    job.mode === "query" && !job.persist && job.profile === "basic";
   if (!job.sourcePath && !streamQuery)
     await mkdir(dirname(out), { recursive: true });
   const resolveSource = async (
@@ -460,7 +479,7 @@ export async function execute(
       // Stream mode: the mount namespace is the boundary, so external access
       // stays ON (otherwise the input views couldn't read their Parquet files).
       await c.run(
-        `CREATE TABLE result AS SELECT * FROM (${sql}) AS foundry_result`,
+        `CREATE ${basicProfile ? "VIEW" : "TABLE"} result AS SELECT * FROM (${sql}) AS foundry_result`,
       );
     }
     if (job.mode === "export") {
@@ -500,6 +519,35 @@ export async function execute(
     // SAMPLE_VALUE_LIMIT so wide tables don't bloat every dataset listing.
     // The full sample still flows to `rows` for staging below.
     const stored = compactSample(sample);
+    if (basicProfile) {
+      // Name, type and a few examples only: everything else needs a scan of
+      // the whole result, which is what this mode exists to avoid.
+      const basicColumns = schema.map((col) => {
+        const name = String(col.column_name);
+        return {
+          name,
+          type: String(col.column_type),
+          nulls: 0,
+          distinct: 0,
+          examples: stored.slice(0, 3).map((r) => r[name]),
+          sensitive: SENSITIVE_NAME.test(name),
+          primaryKey: false,
+        };
+      });
+      return {
+        profile: {
+          rows,
+          columns: basicColumns,
+          sample: stored,
+          fingerprint: createHash("sha256")
+            .update(JSON.stringify([schema, rows]))
+            .digest("hex"),
+          basic: true,
+        } satisfies DatasetProfile,
+        version: job.version,
+        rows: sample,
+      };
+    }
     // Profile one column at a time: exact counts with a per-column fallback
     // to approximate under memory pressure, so a single wide column never
     // strips key evidence from the other columns.
@@ -571,10 +619,7 @@ export async function execute(
           ? {}
           : { blanks: Number(blanks) }),
         examples: stored.slice(0, 3).map((r) => r[name]),
-        sensitive:
-          /email|phone|ssn|password|secret|token|address|birth|credit/i.test(
-            name,
-          ),
+        sensitive: SENSITIVE_NAME.test(name),
         primaryKey:
           exact &&
           rows > 0 &&

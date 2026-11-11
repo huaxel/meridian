@@ -38,7 +38,7 @@ Each area owns its section below; add new routes to your own section.
 | POST `/sources/test`                | `{ name, kind, config }`; discovery and key information                 |
 | POST `/sources`                     | `{ name, kind, config, schedule? }`; encrypted source definition        |
 | POST `/sources/:id/sync`            | `{}`; durable job                                                       |
-| POST `/datasets/:id/preview`        | `{ offset?, limit? }`; rows and profile                                 |
+| POST `/datasets/:id/preview`        | `{ offset?, limit? }`; rows and a basic profile (`profile.basic: true`: row count, column names and types only; `nulls`, `distinct` and `primaryKey` are unmeasured, so use the dataset's own profile for those) |
 | GET `/datasets/:id/export`          | Download active Parquet snapshot                                        |
 | PATCH `/datasets/:id`               | `{ description }`; preserve manually authored description               |
 | POST `/datasets/:id/accept-version` | `{}`; accept staged schema-changing snapshot                            |
