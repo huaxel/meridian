@@ -61,6 +61,24 @@ export interface Store {
 }
 const anchor = (key: string) =>
   g().nWithLabelWhere("FoundryRecord", SourcePredicate.eq("key", key));
+// Many ids in as few round trips as is safe: getMany in chunks, because one
+// request naming hundreds of records is slow to plan and the codebase already
+// treats 50 concurrent reads as the ceiling for Helix. Missing ids are simply
+// absent from the result. Prefer this to a get() per id in a loop or a
+// Promise.all, which costs one round trip per id.
+export async function getAll(
+  store: Pick<Store, "getMany">,
+  scope: string,
+  ids: string[],
+  chunk = 50,
+): Promise<Map<string, Resource>> {
+  const unique = [...new Set(ids)];
+  const out = new Map<string, Resource>();
+  for (let i = 0; i < unique.length; i += chunk)
+    for (const [id, r] of await store.getMany(scope, unique.slice(i, i + chunk)))
+      out.set(id, r);
+  return out;
+}
 // HelixDB refuses a request body over its limit with only "length limit
 // exceeded", so a transaction's write is measured before it is sent. Imports
 // are the usual cause: each selected table is one source in one transaction.
