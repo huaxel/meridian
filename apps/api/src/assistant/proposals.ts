@@ -6,7 +6,13 @@ import {
   datasetTable,
 } from "../../../../packages/shared/src/index.js";
 import { assertOnboardingPublication } from "../onboarding-state.js";
-import { now, resource, transaction, type Store } from "../store.js";
+import {
+  getAll,
+  now,
+  resource,
+  transaction,
+  type Store,
+} from "../store.js";
 import { assert, digest } from "../security.js";
 import { execute } from "../executor.js";
 import { pipelineId } from "../datasets.js";
@@ -151,8 +157,13 @@ export async function publishProposal(
       );
     }
   }
+  const inputDatasets = await getAll(
+    store,
+    scope,
+    Object.keys(report.inputVersions),
+  );
   for (const [datasetId, version] of Object.entries(report.inputVersions)) {
-    const dataset = await store.get(scope, datasetId);
+    const dataset = inputDatasets.get(datasetId);
     assert(
       dataset?.data.activeVersion === version,
       "Input data changed. Revalidate this proposal.",
@@ -247,6 +258,7 @@ export async function publishProposal(
         version: randomUUID(),
         offset,
         limit: 500,
+        profile: "basic",
       });
       const staged = r.rows.map((row) => {
         const key = String(row[type.primaryKey]),
@@ -311,7 +323,10 @@ export async function publishProposal(
       fromDataset = map.get(fromType.datasetId)!,
       toDataset = map.get(toType.datasetId)!,
       on = relationshipJoinCondition(rel, fromDataset.data.profile.columns, toDataset.data.profile.columns);
-    const sql = `SELECT a.${quote(fromType.primaryKey)} AS from_key,b.${quote(toType.primaryKey)} AS to_key FROM ${quote(datasetTable(fromType.datasetId))} a JOIN ${quote(datasetTable(toType.datasetId))} b ON ${on}`;
+    // Every page re-runs this join, and a join's output order is not stable
+    // across runs with more than one DuckDB thread, so unordered pages overlap
+    // and skip edges. Ordering by both keys makes the pages consistent.
+    const sql = `SELECT a.${quote(fromType.primaryKey)} AS from_key,b.${quote(toType.primaryKey)} AS to_key FROM ${quote(datasetTable(fromType.datasetId))} a JOIN ${quote(datasetTable(toType.datasetId))} b ON ${on} ORDER BY 1, 2`;
     let offset = 0,
       total = Infinity;
     while (offset < total) {
@@ -328,6 +343,7 @@ export async function publishProposal(
         version: randomUUID(),
         offset,
         limit: 500,
+        profile: "basic",
       });
       total = r.profile.rows;
       await transaction(store, scope, async (tx) => {
@@ -383,8 +399,13 @@ export async function publishProposal(
   // the assets in bounded chunks first. Every asset has a stable id, so a
   // retry overwrites rather than duplicates, and activation stays in the
   // final transaction below (which still guards on input versions).
+  const catalogDatasets = await getAll(
+    store,
+    scope,
+    bundle.catalog.map((c) => c.datasetId),
+  );
   for (const c of bundle.catalog) {
-    const ds = await store.get(scope, c.datasetId);
+    const ds = catalogDatasets.get(c.datasetId);
     if (ds && !ds.data.manualDescription)
       assets.push({
         ...ds,

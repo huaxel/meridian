@@ -137,7 +137,9 @@ export function registerDataRoutes(
       a.scope,
       [ds.id],
       `SELECT * FROM "${datasetTable(ds.id)}"`,
-      b,
+      // The Data page shows only the page of rows; profiling the whole table
+      // for every page turn is what made large datasets slow to browse.
+      { ...b, profile: "basic" },
     );
   });
   app.patch("/api/v1/workspaces/:w/datasets/:id", async (req: any) => {
@@ -248,7 +250,9 @@ export function registerDataRoutes(
       source = await store.get(a.scope, req.params.id);
     assert(source?.kind === "source", "Source unavailable", 404);
     return transaction(store, a.scope, async (tx) => {
-      const pending = (await tx.list("job")).find(
+      const pending = (
+        await tx.listByStatus("job", ["queued", "running"])
+      ).find(
         (j) =>
           j.data.sourceId === source.id &&
           ["queued", "running"].includes(j.data.status),

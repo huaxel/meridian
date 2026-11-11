@@ -9,6 +9,22 @@ import { datasetTable } from "../packages/shared/src/index.js";
 
 const scope = "test";
 
+// A fake store from a lookup: the real stores batch reads through getMany, so
+// the fake derives it from get().
+const fakeStore = (
+  get: (scope: string, id: string) => Promise<ReturnType<typeof resource> | undefined>,
+) => ({
+  get,
+  getMany: async (s: string, ids: string[]) => {
+    const found = new Map<string, ReturnType<typeof resource>>();
+    for (const id of new Set(ids)) {
+      const r = await get(s, id);
+      if (r) found.set(id, r);
+    }
+    return found;
+  },
+});
+
 function dataset(id: string, version: string) {
   return resource(
     scope,
@@ -21,15 +37,14 @@ function dataset(id: string, version: string) {
 
 describe("build inputs for local datasets", () => {
   it("forwards the mounted source path so the executor reads the file", async () => {
-    const store = {
-      get: async (_s: string, id: string) =>
-        id === "v1"
-          ? resource(scope, "version", "v1", {
-              sourcePath: "zbp/BUT000.parquet",
-              sourceFingerprint: { size: 10, mtimeMs: 20 },
-            })
-          : undefined,
-    };
+    const store = fakeStore(async (_s, id) =>
+      id === "v1"
+        ? resource(scope, "version", "v1", {
+            sourcePath: "zbp/BUT000.parquet",
+            sourceFingerprint: { size: 10, mtimeMs: 20 },
+          })
+        : undefined,
+    );
     const inputs = await inputsFor(
       store as any,
       scope,
@@ -41,7 +56,7 @@ describe("build inputs for local datasets", () => {
   });
 
   it("keeps snapshot resolution for derived inputs without a version record", async () => {
-    const store = { get: async () => undefined };
+    const store = fakeStore(async () => undefined);
     const inputs = await inputsFor(
       store as any,
       scope,
@@ -82,15 +97,14 @@ describe("partition pruning", () => {
   });
 
   it("resolves the declaration by dataset id and fetches the manifest", async () => {
-    const store = {
-      get: async (_s: string, id: string) =>
-        id === "v1"
-          ? resource(scope, "version", "v1", {
-              partitions: manifest,
-              partitionColumn: "region",
-            })
-          : undefined,
-    };
+    const store = fakeStore(async (_s, id) =>
+      id === "v1"
+        ? resource(scope, "version", "v1", {
+            partitions: manifest,
+            partitionColumn: "region",
+          })
+        : undefined,
+    );
     const inputs = [{ table, version: "v1", files, aliases: [] }];
     const map = new Map([[d1.id, d1]]);
     const r = await applyPartitionPrune(
@@ -105,9 +119,9 @@ describe("partition pruning", () => {
 
   it("leaves non-partitioned inputs untouched", async () => {
     const inputs = [{ table, version: "v1", files: ["v1.parquet"] }];
-    const store = {
-      get: async () => resource(scope, "version", "v1", { file: "v1.parquet" }),
-    };
+    const store = fakeStore(async () =>
+      resource(scope, "version", "v1", { file: "v1.parquet" }),
+    );
     const map = new Map([[d1.id, d1]]);
     const r = await applyPartitionPrune(
       inputs,

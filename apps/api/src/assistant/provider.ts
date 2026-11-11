@@ -6,7 +6,7 @@ import {
   datasetAliases,
   datasetTable,
 } from "../../../../packages/shared/src/index.js";
-import type { Store } from "../store.js";
+import { getAll, type Store } from "../store.js";
 import { assert, digest, unseal } from "../security.js";
 import { config } from "../config.js";
 
@@ -70,11 +70,19 @@ export async function inputsFor(
   // version's source path so the executor reads the mounted file instead of
   // a snapshot that was never materialized. Derived-only inputs have no
   // version record and keep resolving to their persisted snapshot.
+  const unique = [...new Set(ids)];
+  for (const id of unique)
+    assert(datasets.get(id)?.data.activeVersion, `Unknown dataset ${id}`);
+  // One batched read for every version record instead of a get per input.
+  const versions = await getAll(
+    store,
+    scope,
+    unique.map((id) => datasets.get(id)!.data.activeVersion as string),
+  );
   return Promise.all(
-    [...new Set(ids)].map(async (id) => {
-      const d = datasets.get(id);
-      assert(d?.data.activeVersion, `Unknown dataset ${id}`);
-      const v = await store.get(scope, d.data.activeVersion as string);
+    unique.map(async (id) => {
+      const d = datasets.get(id)!;
+      const v = versions.get(d.data.activeVersion as string);
       const vd = v?.data;
       return {
         table: datasetTable(id),
@@ -150,9 +158,14 @@ export async function applyPartitionPrune<T extends {
   }
   if (!Object.keys(byTable).length) return inputs;
   const manifests: Record<string, { key: string; file: string }[]> = {};
-  for (const input of inputs) {
-    if (!byTable[input.table]) continue;
-    const v = await store.get(scope, input.version);
+  const scoped = inputs.filter((input) => byTable[input.table]);
+  const versions = await getAll(
+    store,
+    scope,
+    scoped.map((input) => input.version),
+  );
+  for (const input of scoped) {
+    const v = versions.get(input.version);
     if (v?.data.partitions?.length)
       manifests[input.table] = v.data.partitions.map((p: any) => ({
         key: p.key,

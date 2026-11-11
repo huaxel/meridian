@@ -17,6 +17,8 @@ import {
 export const quote = (v: string) => '"' + v.replaceAll('"', '""') + '"';
 const lit = (v: string) => "'" + v.replaceAll("'", "''") + "'";
 const safePart = (s: string) => /^[a-zA-Z0-9_-]{1,100}$/.test(s);
+const SENSITIVE_NAME =
+  /email|phone|ssn|password|secret|token|address|birth|credit/i;
 const isMemoryLimitError = (error: unknown) =>
   /out of memory|memory limit|could not allocate/i.test(String(error));
 // Profiling must never fail an import, and a very wide table can exhaust
@@ -83,6 +85,14 @@ export type Execution = {
   offset?: number;
   limit?: number;
   approximateProfile?: boolean;
+  // Query mode only. "basic" (callers that only read `rows` or the row count)
+  // skips the per-column distinct/null passes and the whole-row hash, and reads
+  // the query lazily instead of materializing it, so paging a large table costs
+  // the page, not the table. The returned profile then has `basic: true`: its
+  // `nulls`, `distinct` and `primaryKey` are unmeasured. Ignored when `persist`
+  // is set, because a persisted result becomes a dataset and needs the full
+  // profile. Default "full".
+  profile?: "full" | "basic";
   // Stream mode only: the executor server bind-mounted each authorized input's
   // files into private paths (sandbox.in[i] is the list of bound paths for
   // inputs[i] — one per partition file) and masked the rest of the filesystem
@@ -241,11 +251,18 @@ async function writePartitions(
   return partitions;
 }
 
+export type ExecutionResult = {
+  profile: DatasetProfile;
+  version: string | undefined;
+  rows: Record<string, any>[];
+  partitions?: { key: string; file: string; rows: number; size: number }[];
+};
+
 export async function execute(
   job: Execution,
   root = resolve(process.env.DATA_DIR || ".data"),
   localRoot = process.env.LOCAL_DATA_PATH || "/mnt/parquet",
-) {
+): Promise<ExecutionResult> {
   if (!safePart(job.scope) || (job.version && !safePart(job.version)))
     throw new Error("Invalid storage identity");
   // Stream-query mode runs inside a mount namespace that masks /data and /mnt,
@@ -260,6 +277,12 @@ export async function execute(
   const out = persistInSandbox
     ? resolve(job.sandbox!.tmp!, "persist.parquet")
     : resolve(root, "datasets", job.scope, `${job.version}.parquet`);
+  const basicProfile =
+    job.mode === "query" && !job.persist && job.profile === "basic";
+  const pagedRead =
+    job.mode === "query" &&
+    !job.persist &&
+    (job.limit !== undefined || job.offset !== undefined);
   if (!job.sourcePath && !streamQuery)
     await mkdir(dirname(out), { recursive: true });
   const resolveSource = async (
@@ -312,9 +335,13 @@ export async function execute(
       allow_unsigned_extensions: "false",
       autoinstall_known_extensions: "false",
       autoload_known_extensions: "false",
-      // Large snapshots and DISTINCT profiling need headroom; the order of
-      // result rows is never relied on, so skip insertion-order bookkeeping.
-      preserve_insertion_order: "false",
+      // Large snapshots and DISTINCT profiling need headroom, so ingest and
+      // whole-result queries skip insertion-order bookkeeping. A paged read
+      // (limit/offset) is the exception: every page is a separate run of the
+      // query, and with more than one thread an unordered scan can return its
+      // rows in a different order each time, so pages overlap and skip rows.
+      // Keeping the scan order makes the pages consistent with each other.
+      preserve_insertion_order: String(pagedRead),
     });
     c = await db.connect();
     if (job.mode === "ingest") {
@@ -460,7 +487,7 @@ export async function execute(
       // Stream mode: the mount namespace is the boundary, so external access
       // stays ON (otherwise the input views couldn't read their Parquet files).
       await c.run(
-        `CREATE TABLE result AS SELECT * FROM (${sql}) AS foundry_result`,
+        `CREATE ${basicProfile ? "VIEW" : "TABLE"} result AS SELECT * FROM (${sql}) AS foundry_result`,
       );
     }
     if (job.mode === "export") {
@@ -500,6 +527,35 @@ export async function execute(
     // SAMPLE_VALUE_LIMIT so wide tables don't bloat every dataset listing.
     // The full sample still flows to `rows` for staging below.
     const stored = compactSample(sample);
+    if (basicProfile) {
+      // Name, type and a few examples only: everything else needs a scan of
+      // the whole result, which is what this mode exists to avoid.
+      const basicColumns = schema.map((col) => {
+        const name = String(col.column_name);
+        return {
+          name,
+          type: String(col.column_type),
+          nulls: 0,
+          distinct: 0,
+          examples: stored.slice(0, 3).map((r) => r[name]),
+          sensitive: SENSITIVE_NAME.test(name),
+          primaryKey: false,
+        };
+      });
+      return {
+        profile: {
+          rows,
+          columns: basicColumns,
+          sample: stored,
+          fingerprint: createHash("sha256")
+            .update(JSON.stringify([schema, rows]))
+            .digest("hex"),
+          basic: true,
+        } satisfies DatasetProfile,
+        version: job.version,
+        rows: sample,
+      };
+    }
     // Profile one column at a time: exact counts with a per-column fallback
     // to approximate under memory pressure, so a single wide column never
     // strips key evidence from the other columns.
@@ -571,10 +627,7 @@ export async function execute(
           ? {}
           : { blanks: Number(blanks) }),
         examples: stored.slice(0, 3).map((r) => r[name]),
-        sensitive:
-          /email|phone|ssn|password|secret|token|address|birth|credit/i.test(
-            name,
-          ),
+        sensitive: SENSITIVE_NAME.test(name),
         primaryKey:
           exact &&
           rows > 0 &&

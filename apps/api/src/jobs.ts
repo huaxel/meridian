@@ -7,6 +7,7 @@ import {
   nextRefresh,
 } from "./source-sync.js";
 import { transaction, resource, type Store } from "./store.js";
+import { pruneJobHistory } from "./job-retention.js";
 import { buildWorkspace, providerSettings, enqueue } from "./assistant.js";
 import { assert } from "./security.js";
 import { runSyncJob, runUploadJob, syncLocalSources } from "./data-jobs.js";
@@ -49,6 +50,11 @@ export function startWorker(store: Store) {
   const stopStreams = startChangeStreams(store);
   let busy = false,
     stopped = false;
+  // Finished-job history is pruned about hourly per workspace. The first pass
+  // waits one interval, so a restart never starts with a full history scan.
+  const pruneEveryMs = Number(process.env.JOB_PRUNE_INTERVAL_MS) || 3_600_000;
+  const startedAt = Date.now();
+  const lastPrune = new Map<string, number>();
   const tick = async () => {
     if (busy || stopped) return false;
     busy = true;
@@ -63,7 +69,9 @@ export function startWorker(store: Store) {
               const s = await tx.get(source.id);
               if (!s || (!scheduledRefresh(s) && !needsChangeRefresh(s)))
                 return;
-              const pending = (await tx.list("job")).find(
+              const pending = (
+                await tx.listByStatus("job", ["queued", "running"])
+              ).find(
                 (j) =>
                   j.data.sourceId === s.id &&
                   ["queued", "running"].includes(j.data.status),
@@ -99,12 +107,27 @@ export function startWorker(store: Store) {
             e instanceof Error ? e.message : e,
           ),
         );
+        if (Date.now() - (lastPrune.get(scope) ?? startedAt) >= pruneEveryMs) {
+          lastPrune.set(scope, Date.now());
+          await pruneJobHistory(store, scope).catch((e) =>
+            console.error(
+              "Worker: pruning job history:",
+              e instanceof Error ? e.message : e,
+            ),
+          );
+        }
         // Storage-level status filter: fetch only queued/running runs+jobs,
         // not the full unbounded history. Pre-upgrade nodes carry the
         // promoted status via the schema-v2 backfill in store.init().
         const [{ items: runs }, { items: jobs }] = await Promise.all([
-          store.listPage(scope, "run", { status: ["queued", "running"] }),
-          store.listPage(scope, "job", { status: ["queued", "running"] }),
+          store.listPage(scope, "run", {
+            status: ["queued", "running"],
+            count: false,
+          }),
+          store.listPage(scope, "job", {
+            status: ["queued", "running"],
+            count: false,
+          }),
         ]);
         const candidate = [...runs, ...jobs]
           .filter(

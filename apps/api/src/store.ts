@@ -44,6 +44,10 @@ export interface ListPageOpts {
   order?: { prop: "updatedAt" | "key"; dir: "asc" | "desc" };
   offset?: number;
   limit?: number;
+  // Set false when only the items are used: HelixDB answers the matching count
+  // with a second query, which a polling caller pays on every tick for nothing.
+  // `total` is then the number of items returned, not the full match count.
+  count?: boolean;
 }
 export interface Store {
   init(): Promise<void>;
@@ -61,6 +65,24 @@ export interface Store {
 }
 const anchor = (key: string) =>
   g().nWithLabelWhere("FoundryRecord", SourcePredicate.eq("key", key));
+// Many ids in as few round trips as is safe: getMany in chunks, because one
+// request naming hundreds of records is slow to plan and the codebase already
+// treats 50 concurrent reads as the ceiling for Helix. Missing ids are simply
+// absent from the result. Prefer this to a get() per id in a loop or a
+// Promise.all, which costs one round trip per id.
+export async function getAll(
+  store: Pick<Store, "getMany">,
+  scope: string,
+  ids: string[],
+  chunk = 50,
+): Promise<Map<string, Resource>> {
+  const unique = [...new Set(ids)];
+  const out = new Map<string, Resource>();
+  for (let i = 0; i < unique.length; i += chunk)
+    for (const [id, r] of await store.getMany(scope, unique.slice(i, i + chunk)))
+      out.set(id, r);
+  return out;
+}
 // HelixDB refuses a request body over its limit with only "length limit
 // exceeded", so a transaction's write is measured before it is sent. Imports
 // are the usual cause: each selected table is one source in one transaction.
@@ -346,17 +368,20 @@ export class HelixStore implements Store {
           .varAs("records", paged.valueMap(["doc"]))
           .returning(["records"]),
       ),
-      this.read(
-        readBatch()
-          .varAs("n", filtered.count())
-          .returning(["n"]),
-      ),
+      opts.count === false
+        ? undefined
+        : this.read(
+            readBatch()
+              .varAs("n", filtered.count())
+              .returning(["n"]),
+          ),
     ]);
+    const parsed = (items.records || [])
+      .filter((x: any) => x.doc)
+      .map((x: any) => JSON.parse(x.doc) as Resource);
     return {
-      items: (items.records || [])
-        .filter((x: any) => x.doc)
-        .map((x: any) => JSON.parse(x.doc) as Resource),
-      total: Number(counted.n ?? 0),
+      items: parsed,
+      total: counted ? Number(counted.n ?? 0) : parsed.length,
     };
   }
   async version(scope: string) {
@@ -646,7 +671,10 @@ export class MemoryStore implements Store {
       opts.limit === undefined
         ? rows.slice(offset)
         : rows.slice(offset, offset + Math.max(1, Math.min(opts.limit, 1000)));
-    return { items: structuredClone(rows), total };
+    return {
+      items: structuredClone(rows),
+      total: opts.count === false ? rows.length : total,
+    };
   }
   async version(s: string) {
     return this.versions.get(s) || 0;
@@ -693,6 +721,28 @@ export class Tx {
     for (const c of this.changes) {
       if ("delete" in c) rows.delete(c.delete);
       else if (!kind || c.put.kind === kind) rows.set(c.put.id, c.put);
+      else rows.delete(c.put.id);
+    }
+    return [...rows.values()];
+  }
+  // The records of a kind whose status is one of `statuses`, as this
+  // transaction sees them: the stored matches filtered in storage, with this
+  // transaction's own writes applied on top (a job it just cancelled drops out,
+  // one it just queued appears). Use it instead of list(kind) when only the
+  // queued/running work matters, so an ever-growing history is never loaded.
+  async listByStatus(kind: string, statuses: string[]) {
+    const rows = new Map(
+      (
+        await this.store.listPage(this.scope, kind, {
+          status: statuses,
+          count: false,
+        })
+      ).items.map((r) => [r.id, r]),
+    );
+    for (const c of this.changes) {
+      if ("delete" in c) rows.delete(c.delete);
+      else if (c.put.kind === kind && statuses.includes(String(c.put.data.status)))
+        rows.set(c.put.id, c.put);
       else rows.delete(c.put.id);
     }
     return [...rows.values()];

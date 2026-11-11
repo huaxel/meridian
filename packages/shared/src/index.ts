@@ -151,6 +151,10 @@ export type DatasetProfile = {
   rows: number;
   duplicateRows?: number;
   approximate?: boolean;
+  // Set on a query result that was read with profile "basic": only `rows`,
+  // column names and types, and examples are measured. `nulls`, `distinct`
+  // and `primaryKey` are placeholders (0, 0, false) and must not be trusted.
+  basic?: boolean;
   columns: ColumnProfile[];
   sample: Record<string, unknown>[];
   fingerprint: string;

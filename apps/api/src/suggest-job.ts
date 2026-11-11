@@ -2,7 +2,7 @@ import type { Resource } from "../../../packages/shared/src/index.js";
 import { suggestOntology } from "./discovery.js";
 import { onboardingState } from "./onboarding-state.js";
 import { jobProgress } from "./setup-jobs.js";
-import { resource, transaction, type Store } from "./store.js";
+import { getAll, resource, transaction, type Store } from "./store.js";
 
 // Background suggestion job: computes the ontology without blocking the setup
 // POST, reporting real stages (reading/keys/matching/proposing) for the progress
@@ -21,16 +21,11 @@ export async function runSuggestJob(
   };
   if (!onboardingSignature || !datasetIds?.length)
     throw new Error("Suggestion inputs changed. Retry the suggestion.");
-  // Chunked loads: hundreds of simultaneous Helix reads overwhelm it.
+  // Batched loads (getAll chunks them): hundreds of simultaneous Helix reads
+  // overwhelm it. Order follows the requested ids; missing ones are dropped.
   const chunked = async (ids: string[]) => {
-    const out: Resource[] = [];
-    for (let i = 0; i < ids.length; i += 50)
-      out.push(
-        ...(
-          await Promise.all(ids.slice(i, i + 50).map((id) => store.get(scope, id)))
-        ).filter((r) => !!r),
-      );
-    return out;
+    const found = await getAll(store, scope, ids);
+    return [...new Set(ids)].flatMap((id) => found.get(id) ?? []);
   };
   const [datasets, sources] = await Promise.all([
     chunked(datasetIds || []),
@@ -83,7 +78,7 @@ export async function runSuggestJob(
   ).length;
   if (curatedCount) {
     await transaction(store, scope, async (tx) => {
-      const active = (await tx.list("job")).some(
+      const active = (await tx.listByStatus("job", ["queued", "running"])).some(
         (j) =>
           j.data.type === "validate" &&
           j.data.onboardingSignature === onboardingSignature &&

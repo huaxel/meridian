@@ -15,7 +15,13 @@ import { onboardingState } from "../onboarding-state.js";
 import { effectiveObject } from "../context.js";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import { now, resource, transaction, type Store } from "../store.js";
+import {
+  getAll,
+  now,
+  resource,
+  transaction,
+  type Store,
+} from "../store.js";
 import { assert, digest, redact } from "../security.js";
 import { Provider } from "../providers.js";
 import { execute } from "../executor.js";
@@ -202,17 +208,19 @@ export async function buildWorkspace(store: Store, scope: string, id: string) {
   // every partition stays the safe default when it names none.
   const partitionInfo: Record<string, { column: string; values: string[] }> =
     {};
-  await Promise.all(
-    focal.map(async (d) => {
-      const v = await store.get(scope, d.data.activeVersion as string);
-      const vd = v?.data;
-      if (vd?.partitions?.length)
-        partitionInfo[datasetTable(d.id)] = {
-          column: vd.partitionColumn as string,
-          values: vd.partitions.slice(0, 200).map((p: any) => String(p.key)),
-        };
-    }),
+  const focalVersions = await getAll(
+    store,
+    scope,
+    focal.map((d) => d.data.activeVersion as string),
   );
+  for (const d of focal) {
+    const vd = focalVersions.get(d.data.activeVersion as string)?.data;
+    if (vd?.partitions?.length)
+      partitionInfo[datasetTable(d.id)] = {
+        column: vd.partitionColumn as string,
+        values: vd.partitions.slice(0, 200).map((p: any) => String(p.key)),
+      };
+  }
   const inputVersions = Object.fromEntries(
     datasets.map((d) => [d.id, d.data.activeVersion]),
   );
