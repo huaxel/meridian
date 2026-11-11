@@ -279,6 +279,10 @@ export async function execute(
     : resolve(root, "datasets", job.scope, `${job.version}.parquet`);
   const basicProfile =
     job.mode === "query" && !job.persist && job.profile === "basic";
+  const pagedRead =
+    job.mode === "query" &&
+    !job.persist &&
+    (job.limit !== undefined || job.offset !== undefined);
   if (!job.sourcePath && !streamQuery)
     await mkdir(dirname(out), { recursive: true });
   const resolveSource = async (
@@ -331,9 +335,13 @@ export async function execute(
       allow_unsigned_extensions: "false",
       autoinstall_known_extensions: "false",
       autoload_known_extensions: "false",
-      // Large snapshots and DISTINCT profiling need headroom; the order of
-      // result rows is never relied on, so skip insertion-order bookkeeping.
-      preserve_insertion_order: "false",
+      // Large snapshots and DISTINCT profiling need headroom, so ingest and
+      // whole-result queries skip insertion-order bookkeeping. A paged read
+      // (limit/offset) is the exception: every page is a separate run of the
+      // query, and with more than one thread an unordered scan can return its
+      // rows in a different order each time, so pages overlap and skip rows.
+      // Keeping the scan order makes the pages consistent with each other.
+      preserve_insertion_order: String(pagedRead),
     });
     c = await db.connect();
     if (job.mode === "ingest") {

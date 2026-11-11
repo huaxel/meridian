@@ -323,7 +323,10 @@ export async function publishProposal(
       fromDataset = map.get(fromType.datasetId)!,
       toDataset = map.get(toType.datasetId)!,
       on = relationshipJoinCondition(rel, fromDataset.data.profile.columns, toDataset.data.profile.columns);
-    const sql = `SELECT a.${quote(fromType.primaryKey)} AS from_key,b.${quote(toType.primaryKey)} AS to_key FROM ${quote(datasetTable(fromType.datasetId))} a JOIN ${quote(datasetTable(toType.datasetId))} b ON ${on}`;
+    // Every page re-runs this join, and a join's output order is not stable
+    // across runs with more than one DuckDB thread, so unordered pages overlap
+    // and skip edges. Ordering by both keys makes the pages consistent.
+    const sql = `SELECT a.${quote(fromType.primaryKey)} AS from_key,b.${quote(toType.primaryKey)} AS to_key FROM ${quote(datasetTable(fromType.datasetId))} a JOIN ${quote(datasetTable(toType.datasetId))} b ON ${on} ORDER BY 1, 2`;
     let offset = 0,
       total = Infinity;
     while (offset < total) {
